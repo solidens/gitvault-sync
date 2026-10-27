@@ -757,3 +757,20 @@ test("AuthError mid-cycle leaves files and state intact and rethrows", async () 
   expect(await text(A.fs, "n.md")).toBe("v2");
   expect(fTree(fake)).toHaveLength(2);
 });
+
+test("edit of a file deleted on GitHub is uploaded even when the first upload fails", async () => {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A"), B = makeDevice(fake, keys, "B");
+  A.fs.set("x.md", "one\n");
+  await A.engine.sync();
+  await B.engine.sync();
+  A.fs.remove("x.md");
+  await A.engine.sync();
+  B.fs.set("x.md", "one\ntwo\n");
+  B.api.failNext("putFile", new Error("network down"));
+  await expect(B.engine.sync()).rejects.toThrow("network down");
+  expect((await B.engine.sync()).pushed).toEqual(["x.md"]);
+  const C = makeDevice(fake, keys, "C");
+  await C.engine.sync();
+  expect(await text(C.fs, "x.md")).toBe("one\ntwo\n");
+});

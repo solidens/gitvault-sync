@@ -89,7 +89,8 @@ export class SyncEngine {
     let tree: Map<string, string> | null = null;
     if (!head.notModified) {
       base = head.sha;
-      if (head.sha !== state.headSha) tree = head.sha === null ? new Map() : await api.getTree(head.sha);
+      // a retry re-reads the tree even on an unchanged head: the conflict may come from a stale state record
+      if (repoll || head.sha !== state.headSha) tree =head.sha === null ? new Map() : await api.getTree(head.sha);
     }
 
     // 2. Local scan: rehash only files whose mtime/size changed.
@@ -172,8 +173,10 @@ export class SyncEngine {
         continue;
       }
       if (!rem) { // deleted on GitHub (rec exists)
-        if (loc && localChanged) pushes.push({ path: p, token: rec!.token, prev: null, local: loc }); // edit beats delete
-        else if (loc) trashes.push({ p, loc });
+        if (loc && localChanged) { // edit beats delete; uploaded as new, so drop the record of the deleted remote blob
+          pushes.push({ path: p, token: rec!.token, prev: null, local: loc });
+          delete state.files[p];
+        } else if (loc) trashes.push({ p, loc });
         else delete state.files[p];
         continue;
       }
