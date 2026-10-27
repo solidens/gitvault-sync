@@ -85,4 +85,21 @@ describe("FakeGitHub", () => {
     fake.onBeforeWrite = async () => { fake.onBeforeWrite = undefined; await b.putFile("z", "1", null, "m"); };
     await expect(a.commitBatch(base.commitSha, [{ path: "y", text: "1" }], "m")).rejects.toBeInstanceOf(ShaConflictError);
   });
+  test("concurrent puts of different files both land", async () => {
+    const fake = new FakeGitHub();
+    await Promise.all([fake.client().putFile("x", "1", null, "m"), fake.client().putFile("y", "2", null, "m")]);
+    expect([...(await fake.getTree(fake.head!)).keys()].sort()).toEqual(["x", "y"]);
+  });
+  test("concurrent batch vs put: batch fails if head moved", async () => {
+    const fake = new FakeGitHub();
+    const a = fake.client(), b = fake.client();
+    const base = await a.putFile("x", "1", null, "m");
+    const [r1, r2] = await Promise.allSettled([
+      b.putFile("y", "2", null, "m"),
+      a.commitBatch(base.commitSha, [{ path: "z", text: "3" }], "m"),
+    ]);
+    expect(r1.status).toBe("fulfilled");
+    expect(r2.status).toBe("rejected");
+    expect([...(await fake.getTree(fake.head!)).keys()].sort()).toEqual(["x", "y"]);
+  });
 });

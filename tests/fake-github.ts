@@ -77,10 +77,11 @@ export class FakeGitHub implements GitHubApi {
     return t;
   }
   async putFile(path: string, text: string, prevBlobSha: string | null, message: string) {
+    const blobSha = await gitBlobSha(text);
     await this.write("putFile", 1);
+    // check + commit below are synchronous: no await between snapshot and commit
     const tree = this.headTree();
     if ((tree.get(path) ?? null) !== prevBlobSha) throw new ShaConflictError(path);
-    const blobSha = await gitBlobSha(text);
     this.s.blobs.set(blobSha, text);
     tree.set(path, blobSha);
     return { blobSha, commitSha: this.commit(tree, message) };
@@ -93,17 +94,14 @@ export class FakeGitHub implements GitHubApi {
     return { commitSha: this.commit(tree, message) };
   }
   async commitBatch(baseCommit: string, changes: { path: string; text: string | null }[], message: string) {
+    const shas = await Promise.all(changes.map((c) => (c.text === null ? null : gitBlobSha(c.text))));
     await this.write("commitBatch", 3);
     if (this.head !== baseCommit) throw new ShaConflictError();
     const tree = this.headTree();
-    for (const c of changes) {
+    changes.forEach((c, i) => {
       if (c.text === null) tree.delete(c.path);
-      else {
-        const sha = await gitBlobSha(c.text);
-        this.s.blobs.set(sha, c.text);
-        tree.set(c.path, sha);
-      }
-    }
+      else { this.s.blobs.set(shas[i]!, c.text); tree.set(c.path, shas[i]!); }
+    });
     return { commitSha: this.commit(tree, message) };
   }
   async getTarball(commitSha: string) {
