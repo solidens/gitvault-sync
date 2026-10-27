@@ -5,7 +5,7 @@ import type { GitHubApi } from "../src/github";
 import { AuthError, RateLimitError } from "../src/http";
 import { makeDevice, setupRepo } from "./helpers";
 
-const SEEDS = 200;
+const SEEDS = Number(process.env.SIM_SEEDS ?? 200); // SIM_SEEDS=2000 npm test -- sim for a longer hunt
 const STEPS = 300;
 
 function mulberry32(seed: number): () => number {
@@ -25,7 +25,11 @@ const NAMES = [
   "résumé.md", "img.png", "папка/фото.jpg",
 ].map((n) => n.normalize("NFC"));
 const isBinary = (p: string) => /\.(png|jpg)$/.test(p);
-const API: (keyof GitHubApi)[] = ["getHead", "getTree", "getBlobText", "putFile", "deleteFile", "commitBatch", "getTarball", "fileHistoryBlobShas"];
+// weighted toward the calls every cycle makes
+const API: (keyof GitHubApi)[] = [
+  "putFile", "putFile", "putFile", "getTree", "getTree", "getBlobText", "getBlobText", "getBlobText", "getHead", "getHead",
+  "deleteFile", "commitBatch", "getTarball", "fileHistoryBlobShas",
+];
 
 const dec = (b: ArrayBuffer) => new TextDecoder().decode(b);
 /** Every user write is a unique tag `#n#` (one per line, or the whole binary); a file's content = its tags. */
@@ -55,6 +59,19 @@ async function runSeed(seed: number): Promise<void> {
   const written = new Set<string>(), killed = new Set<string>();
   const fresh = () => { const t = `#${++n}#`; written.add(t); return t; };
   const injected = new Set<Error>();
+  /**
+   * A user op removed `ts` from `path`. A tag another file on that disk still holds (a conflict copy, a rename seen
+   * as a copy) is not gone yet: it is killed by the next user op removing it, so losing the other copy is caught.
+   */
+  const removedOnce = new Set<string>();
+  const kill = async (fs: (typeof devs)[number]["fs"], path: string, ts: string[]) => {
+    const elsewhere = new Set<string>();
+    for (const q of fs.paths()) if (q !== path) tags(await fs.read(q)).forEach((t) => elsewhere.add(t));
+    for (const t of ts) {
+      if (!elsewhere.has(t) || removedOnce.has(t)) killed.add(t);
+      else removedOnce.add(t);
+    }
+  };
 
   const sync = async (i: number): Promise<SyncReport | null> => {
     try {
@@ -63,6 +80,13 @@ async function runSeed(seed: number): Promise<void> {
       if (!injected.has(e as Error)) throw new Error(`seed ${seed}: unexpected sync failure on ${"ABC"[i]}: ${(e as Error).stack}\n${trace.join("\n")}`);
       return null;
     }
+  };
+
+  // Nobody else acts during a solo sync, so GitHub cannot move under it: giving up on sha conflicts means a stale state.
+  const solo = async (i: number): Promise<SyncReport | null> => {
+    const rep = await sync(i);
+    if (rep?.gaveUp.length) throw new Error(`seed ${seed}: solo sync on ${"ABC"[i]} gave up on ${rep.gaveUp}\n${trace.join("\n")}`);
+    return rep;
   };
 
   for (let step = 0; step < STEPS; step++) {
@@ -78,23 +102,24 @@ async function runSeed(seed: number): Promise<void> {
       trace.push(`${step} ${"ABC"[i]} create ${p} ${t}`);
     } else if (r < 0.32 && files.length) { // append a line
       const p = pick(files), old = await fs.read(p), t = fresh();
-      if (isBinary(p)) { tags(old).forEach((x) => killed.add(x)); fs.set(p, binary(t)); }
+      if (isBinary(p)) { await kill(fs, p, tags(old)); fs.set(p, binary(t)); }
       else fs.set(p, `${dec(old)}${dec(old).endsWith("\n") || !old.byteLength ? "" : "\n"}${t}\n`);
       trace.push(`${step} ${"ABC"[i]} append ${p} ${t}`);
     } else if (r < 0.47 && files.length) { // modify a line
       const p = pick(files), old = await fs.read(p), t = fresh();
       const lines = dec(old).split("\n"), idx = lines.map((l, k) => (l ? k : -1)).filter((k) => k >= 0);
-      if (isBinary(p) || !idx.length) { tags(old).forEach((x) => killed.add(x)); fs.set(p, isBinary(p) ? binary(t) : `${t}\n`); }
+      if (isBinary(p) || !idx.length) { await kill(fs, p, tags(old)); fs.set(p, isBinary(p) ? binary(t) : `${t}\n`); }
       else {
         const k = pick(idx);
-        (lines[k].match(/#\d+#/g) ?? []).forEach((x) => killed.add(x));
+        const gone = lines[k].match(/#\d+#/g) ?? [];
+        await kill(fs, p, gone.filter((x) => !lines.some((l, j) => j !== k && l.includes(x))));
         lines[k] = t;
         fs.set(p, lines.join("\n"));
       }
       trace.push(`${step} ${"ABC"[i]} modify ${p} ${t}`);
     } else if (r < 0.53 && files.length) { // delete
       const p = pick(files);
-      tags(await fs.read(p)).forEach((x) => killed.add(x));
+      await kill(fs, p, tags(await fs.read(p)));
       fs.remove(p);
       trace.push(`${step} ${"ABC"[i]} delete ${p}`);
     } else if (r < 0.59 && files.length) { // rename
@@ -105,7 +130,7 @@ async function runSeed(seed: number): Promise<void> {
       fs.set(q, data);
       trace.push(`${step} ${"ABC"[i]} rename ${p} -> ${q}`);
     } else if (r < 0.79) { // sync
-      trace.push(`${step} ${"ABC"[i]} sync ${JSON.stringify(await sync(i))}`);
+      trace.push(`${step} ${"ABC"[i]} sync ${JSON.stringify(await solo(i))}`);
     } else if (r < 0.91) { // sync with one injected fault
       const kind = int(4);
       let err: Error;
@@ -116,6 +141,11 @@ async function runSeed(seed: number): Promise<void> {
       }
       injected.add(err);
       trace.push(`${step} ${"ABC"[i]} sync+fault(${err.name}) ${JSON.stringify(await sync(i))}`);
+      // the scheduler retries within seconds, often before any other device commits
+      if (rnd() < 0.5) trace.push(`${step} ${"ABC"[i]} retry ${JSON.stringify(await solo(i))}`);
+    } else if (r < 0.93) { // plugin reload: new engine over the same disk and state
+      d.engine = d.restart();
+      trace.push(`${step} ${"ABC"[i]} restart`);
     } else { // two devices race
       const j = (i + 1 + int(2)) % 3;
       const [a, b] = await Promise.all([sync(i), sync(j)]);
@@ -133,23 +163,25 @@ async function runSeed(seed: number): Promise<void> {
     for (let i = 0; i < 3; i++) {
       const rep = await devs[i].engine.sync();
       trace.push(`final ${round} ${"ABC"[i]} ${JSON.stringify(rep)}`);
-      const busy = rep.pulled.length || rep.pushed.length || rep.deleted.length || rep.conflicts.length || rep.deferred.length || rep.rateLimitedUntil;
+      const busy = rep.pulled.length || rep.pushed.length || rep.deleted.length || rep.conflicts.length || rep.deferred.length || rep.gaveUp.length || rep.rateLimitedUntil;
       if (busy) quiet = false;
     }
   }
   const ctx = `seed ${seed}\n${trace.join("\n")}`;
   expect(quiet, `did not converge in 5 rounds; ${ctx}`).toBe(true);
 
-  // 1) same NFC paths and bytes everywhere, and GitHub holds exactly that many files
-  const snap = async (i: number) => {
+  // 1) same NFC paths and bytes everywhere, and a fresh device pulling once from GitHub gets exactly that
+  const snap = async (d: (typeof devs)[number]) => {
     const out: [string, string][] = [];
-    for (const p of devs[i].fs.paths()) out.push([p.normalize("NFC"), Buffer.from(await devs[i].fs.read(p)).toString("hex")]);
+    for (const p of d.fs.paths()) out.push([p.normalize("NFC"), Buffer.from(await d.fs.read(p)).toString("hex")]);
     return out.sort();
   };
-  const final = await snap(0);
-  expect(await snap(1), ctx).toEqual(final);
-  expect(await snap(2), ctx).toEqual(final);
-  expect([...fake.commits.at(-1)!.tree.keys()].filter((p) => p.startsWith("f/")).length, ctx).toBe(final.length);
+  const final = await snap(devs[0]);
+  expect(await snap(devs[1]), ctx).toEqual(final);
+  expect(await snap(devs[2]), ctx).toEqual(final);
+  const D = makeDevice(fake, keys, "D", { now });
+  expect((await D.engine.sync()).pushed, ctx).toEqual([]);
+  expect(await snap(D), `fresh device; ${ctx}`).toEqual(final);
 
   // 2) every tag written and never removed by a user op survives somewhere
   const present = new Set<string>();

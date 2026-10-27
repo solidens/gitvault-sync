@@ -858,3 +858,17 @@ test("typing into the very file being pulled → write refused, deferred, then m
   expect((await B.engine.sync()).conflicts).toEqual([]);
   expect(await text(B.fs, "x.md")).toBe("ONE\ntwo typed");
 });
+
+test("renamed back to a name whose old content it matches, while another device re-created it → conflict copy", async () => {
+  const { A, B } = await pair({ "b.md": "X" });
+  B.fs.remove("b.md");
+  B.fs.set("a.md", "X");
+  await B.engine.sync();
+  await A.engine.sync();
+  A.fs.set("b.md", "Y");
+  await A.engine.sync();
+  B.fs.remove("a.md");
+  B.fs.set("b.md", "X"); // equals an old remote version of b.md, but B has state: not a stale copy
+  expect((await B.engine.sync()).conflicts).toEqual(["b (conflict B 2026-10-27 1405).md"]);
+  expect(await text(B.fs, "b (conflict B 2026-10-27 1405).md")).toBe("X");
+});
