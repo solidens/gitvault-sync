@@ -236,3 +236,70 @@ test("genuinely different edits on both sides throw until Task 9", async () => {
   await expect(B.engine.sync()).rejects.toThrow("conflict: Task 9");
   expect(await text(B.fs, "n.md")).toBe("b");
 });
+
+async function toggleSetup(bContent: string) {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A", { settings: { syncConfig: true } });
+  const B = makeDevice(fake, keys, "B");
+  for (let i = 0; i < 6; i++) A.fs.set(`.obsidian/c${i}.json`, "A");
+  await A.engine.sync();
+  for (let i = 0; i < 6; i++) B.fs.set(`.obsidian/c${i}.json`, bContent);
+  B.fs.set("n.md", "n");
+  await B.engine.sync();
+  await A.engine.sync();
+  await B.engine.sync();
+  B.settings.syncConfig = true;
+  return { fake, keys, B };
+}
+
+test("turning syncConfig on never overwrites other devices' config", async () => {
+  const { fake, keys, B } = await toggleSetup("B");
+  const writes = fake.totalWrites;
+  await expect(B.engine.sync()).rejects.toThrow("conflict: Task 9");
+  expect(fake.totalWrites).toBe(writes);
+  expect(await text(B.fs, ".obsidian/c0.json")).toBe("B");
+  const C = makeDevice(fake, keys, "C", { settings: { syncConfig: true } });
+  await C.engine.sync();
+  for (let i = 0; i < 6; i++) expect(await text(C.fs, `.obsidian/c${i}.json`)).toBe("A");
+});
+
+test("turning syncConfig on with identical config only records state", async () => {
+  const { fake, B } = await toggleSetup("A");
+  const writes = fake.totalWrites;
+  expect(await B.engine.sync()).toMatchObject({ pushed: [], pulled: [] });
+  expect(fake.totalWrites).toBe(writes);
+  expect(Object.keys(B.store.saved!.files)).toHaveLength(7);
+  expect(B.store.saved!.skipped).toEqual({});
+});
+
+test("removing an ignore pattern never overwrites the remote file", async () => {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A");
+  const B = makeDevice(fake, keys, "B", { settings: { ignore: ["private/**"] } });
+  A.fs.set("private/x.md", "A");
+  await A.engine.sync();
+  B.fs.set("private/x.md", "B");
+  await B.engine.sync();
+  await B.engine.sync();
+  B.settings.ignore = [];
+  await expect(B.engine.sync()).rejects.toThrow("conflict: Task 9");
+  const C = makeDevice(fake, keys, "C");
+  await C.engine.sync();
+  expect(await text(C.fs, "private/x.md")).toBe("A");
+});
+
+test("restart does not re-download skipped remote files", async () => {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A", { settings: { syncConfig: true } });
+  const B = makeDevice(fake, keys, "B");
+  A.fs.set(".obsidian/app.json", "{}");
+  await A.engine.sync();
+  await B.engine.sync();
+  const B2 = B.restart();
+  A.fs.set("m.md", "m");
+  await A.engine.sync();
+  const reads = B.api.reads;
+  await B2.sync();
+  expect(B.api.reads).toBe(reads + 3); // getHead, getTree, m.md
+  expect(B.fs.paths()).toEqual(["m.md"]);
+});

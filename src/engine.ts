@@ -33,9 +33,6 @@ interface Remote { token: string; sha: string; data?: ArrayBuffer }
 interface Push { path: string; token: string; prev: string | null; local: Local | null }
 
 export class SyncEngine {
-  /** token -> blob sha of remote files this device does not sync (ignored / config), so they are not re-downloaded. */
-  private skippedTokens = new Map<string, string>();
-
   constructor(private d: EngineDeps) {}
 
   async sync(): Promise<SyncReport> {
@@ -46,6 +43,13 @@ export class SyncEngine {
     const tooLarge = new Set<string>();
     const skip = (p: string) =>
       tooLarge.has(p) || isIgnored(p, ignore) || (!settings.syncConfig && p.startsWith(".obsidian/"));
+
+    // Skip rules changed -> refetch the full tree so files that just became visible are seen as remote, not as new.
+    const filter = JSON.stringify([settings.syncConfig, settings.ignore, settings.maxFileBytes]);
+    if (state.filter !== filter) {
+      state.headSha = state.refEtag = null;
+      state.filter = filter;
+    }
 
     // 1. Poll. headSha/refEtag only decide whether to fetch the tree; changes are detected per file.
     const head = await api.getHead(state.refEtag);
@@ -73,29 +77,42 @@ export class SyncEngine {
       local.set(p, { diskPath: st.path, mtime: st.mtime, size: st.size, hash });
     }
 
-    // Remote view: from the tree if the branch moved, otherwise what we last saw.
+    // Remote view: from the tree if the branch moved, otherwise what we last saw (synced + skipped files).
     const remote = new Map<string, Remote>();
+    const remoteTokens = new Map<string, string>(); // token -> blob sha of every known remote vault file
+    const skipped: NonNullable<SyncState["skipped"]> = {};
+    const addRemote = async (token: string, sha: string, known?: string) => {
+      remoteTokens.set(token, sha);
+      if (known !== undefined) return void remote.set(known, { token, sha });
+      const cached = state.skipped?.[token];
+      // unknown token: only the content knows its path
+      const f = cached?.blobSha === sha ? { path: cached.path, data: undefined } : await this.download(sha);
+      if (skip(f.path)) skipped[token] = { blobSha: sha, path: f.path };
+      else remote.set(f.path, { token, sha, data: f.data });
+    };
+    const byToken = new Map(Object.entries(state.files).map(([p, r]) => [r.token, p]));
     if (tree) {
-      const byToken = new Map(Object.entries(state.files).map(([p, r]) => [r.token, p]));
       for (const [rp, sha] of tree) {
         if (!rp.startsWith("f/")) continue; // gitvault.json etc.
         const token = rp.slice(rp.lastIndexOf("/") + 1);
-        const known = byToken.get(token);
-        if (known !== undefined) { remote.set(known, { token, sha }); continue; }
-        if (this.skippedTokens.get(token) === sha) continue;
-        const f = await this.download(sha); // unknown token: only the content knows its path
-        if (skip(f.path)) { this.skippedTokens.set(token, sha); continue; }
-        remote.set(f.path, { token, sha, data: f.data });
+        await addRemote(token, sha, byToken.get(token));
       }
     } else {
-      for (const [p, r] of Object.entries(state.files)) remote.set(p, { token: r.token, sha: r.blobSha });
+      for (const [token, p] of byToken) await addRemote(token, state.files[p].blobSha, p);
+      for (const [token, e] of Object.entries(state.skipped ?? {})) await addRemote(token, e.blobSha);
     }
+    state.skipped = skipped;
 
     // 3. Pull / decide pushes.
     const pushes: Push[] = [];
     for (const p of new Set([...Object.keys(state.files), ...local.keys(), ...remote.keys()])) {
       if (skip(p)) continue;
-      const rec = state.files[p], loc = local.get(p), rem = remote.get(p);
+      const rec = state.files[p], loc = local.get(p);
+      let rem = remote.get(p);
+      if (!rec && !rem && loc) { // defense in depth: never create over an existing remote file
+        const token = await pathToken(keys, p), sha = remoteTokens.get(token);
+        if (sha !== undefined) rem = { token, sha };
+      }
       const localChanged = rec ? loc?.hash !== rec.localHash : !!loc;
       const remoteChanged = rec ? rem?.sha !== rec.blobSha : !!rem;
       if (!localChanged && !remoteChanged) continue;

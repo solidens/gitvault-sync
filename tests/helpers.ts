@@ -33,11 +33,14 @@ export function makeDevice(
   const store = new MemoryStateStore();
   const api = fake.client();
   const now = opts.now ?? (() => Date.now());
-  const engine = new SyncEngine({
-    api, fs, keys, store, deviceName: name, now,
-    settings: { ...DEFAULT_ENGINE_SETTINGS, ...opts.settings },
+  const settings = { ...DEFAULT_ENGINE_SETTINGS, ...opts.settings }; // mutable: tests toggle settings mid-life
+  const deps = {
+    api, fs, keys, store, deviceName: name, now, settings,
     bucket: opts.bucket ?? new TokenBucket(20, 4, now),
     confirmMassDelete: opts.confirmMassDelete ?? (async () => true),
-  });
-  return { fs, store, engine, api };
+  };
+  const engine = new SyncEngine(deps);
+  /** New engine over the same disk and state, like a plugin reload. */
+  const restart = () => new SyncEngine(deps);
+  return { fs, store, engine, api, settings, restart };
 }
