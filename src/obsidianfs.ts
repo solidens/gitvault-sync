@@ -11,6 +11,9 @@ function exactText(b: ArrayBuffer): string | null {
     return null;
   }
 }
+/** Editor buffers and text reads may turn CRLF into LF or drop a BOM: not a user edit. */
+const norm = (s: string) => s.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
+
 function sameBytes(a: ArrayBuffer, b: ArrayBuffer): boolean {
   const x = new Uint8Array(a), y = new Uint8Array(b);
   return x.length === y.length && x.every((v, i) => v === y[i]);
@@ -61,7 +64,7 @@ export class ObsidianFs implements LocalFs {
     const text = existing && expected ? exactText(data) : null, want = text !== null && expected ? exactText(expected) : null;
     if (existing && text !== null && want !== null) {
       // atomic against the editor: an open note's unsaved typing makes `cur` differ and the write is refused
-      await this.app.vault.process(existing, (cur) => { if (cur !== want) throw new LocalChangedError(path); return text; });
+      await this.app.vault.process(existing, (cur) => { if (norm(cur) !== norm(want)) throw new LocalChangedError(path); return text; });
     } else if (existing) {
       // shortcut: binary files have no atomic compare-and-swap; this check leaves a tiny window
       if (expected && !sameBytes(await this.adapter.readBinary(path), expected)) throw new LocalChangedError(path);

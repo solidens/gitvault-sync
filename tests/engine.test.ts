@@ -3,6 +3,7 @@ import { TokenBucket } from "../src/bucket";
 import { AuthError, RateLimitError, ShaConflictError } from "../src/http";
 import { createVault } from "../src/crypto";
 import { SyncEngine, UNDECRYPTABLE } from "../src/engine";
+import { LocalChangedError } from "../src/localfs";
 import { FakeGitHub } from "./fake-github";
 import { makeDevice, setupRepo, text } from "./helpers";
 
@@ -871,4 +872,63 @@ test("renamed back to a name whose old content it matches, while another device 
   B.fs.set("b.md", "X"); // equals an old remote version of b.md, but B has state: not a stale copy
   expect((await B.engine.sync()).conflicts).toEqual(["b (conflict B 2026-10-27 1405).md"]);
   expect(await text(B.fs, "b (conflict B 2026-10-27 1405).md")).toBe("X");
+});
+
+test("interrupted rebind: stale local copies after a rate limit are still pulled, not conflict-copied", async () => {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A", at), B = makeDevice(fake, keys, "B", at);
+  A.fs.set("a.md", "a1");
+  A.fs.set("n.md", "n1");
+  await A.engine.sync();
+  await B.engine.sync();
+  A.fs.set("a.md", "a2");
+  A.fs.set("n.md", "n2");
+  await A.engine.sync();
+  B.store.saved = null; // lost state; B's files are old versions
+  const orig = B.api.getBlobText.bind(B.api);
+  let armed = false;
+  B.fs.onBeforeWrite = (p) => { if (p === "a.md") armed = true; };
+  B.api.getBlobText = async (sha) => {
+    if (!armed) return orig(sha);
+    B.api.getBlobText = orig;
+    throw new RateLimitError(T + 1000);
+  };
+  expect((await B.engine.sync()).rateLimitedUntil).toBe(T + 1000);
+  expect(Object.keys(B.store.saved!.files).length).toBeGreaterThan(0); // partly bound
+  const r = await B.engine.sync();
+  expect(r.conflicts).toEqual([]);
+  expect(await text(B.fs, "n.md")).toBe("n2");
+  expect(B.store.saved!.rebinding).toBeUndefined();
+});
+
+test("CAS that keeps refusing an unchanged file falls back to a byte-checked write after 3 tries", async () => {
+  const { A, B } = await pair({ "x.md": "one", "y.md": "y\n" });
+  A.fs.set("x.md", "two");
+  A.fs.set("y.md", "y\nA\n");
+  await A.engine.sync();
+  B.fs.set("y.md", "B\ny\n"); // both changed: merge path
+  const write = B.fs.write.bind(B.fs);
+  B.fs.write = async (p, data, expected) => { // editor-level check that never matches (e.g. CRLF buffer)
+    if (expected) throw new LocalChangedError(p);
+    return write(p, data, expected);
+  };
+  for (let i = 0; i < 2; i++) expect((await B.engine.sync()).deferred.sort()).toEqual(["x.md", "y.md"]);
+  expect((await B.engine.sync()).deferred).toEqual([]);
+  expect(await text(B.fs, "x.md")).toBe("two");
+  expect(await text(B.fs, "y.md")).toBe("B\ny\nA\n");
+  await A.engine.sync();
+  expect(await text(A.fs, "y.md")).toBe("B\ny\nA\n"); // the local edit was uploaded too
+});
+
+test("overlapping edit with the target being typed into → deferred without a conflict copy", async () => {
+  const { A, B } = await pair({ "n.md": "a" });
+  A.fs.set("n.md", "theirs");
+  await A.engine.sync();
+  B.fs.set("n.md", "mine");
+  B.fs.onBeforeWrite = (p) => { if (p === "n.md") { B.fs.onBeforeWrite = undefined; B.fs.set("n.md", "mine typed"); } };
+  const r = await B.engine.sync();
+  expect(r).toMatchObject({ deferred: ["n.md"], conflicts: [] });
+  expect(B.fs.paths()).toEqual(["n.md"]);
+  expect((await B.engine.sync()).conflicts).toEqual(["n (conflict B 2026-10-27 1405).md"]);
+  expect(await text(B.fs, "n (conflict B 2026-10-27 1405).md")).toBe("mine typed");
 });

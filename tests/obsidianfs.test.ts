@@ -77,3 +77,11 @@ test("state load falls back to the .tmp file left by an interrupted save", async
   disk.set("dir/state.json", buf("{corrupt"));
   expect((await store.load())?.headSha).toBe("def");
 });
+
+test("CAS ignores CRLF→LF and a dropped BOM in the editor's text", async () => {
+  const { fs, disk, editor } = rig();
+  disk.set("n.md", buf("a\r\nb"));
+  editor.set("n.md", "﻿a\nb");
+  await fs.write("n.md", buf("new"), buf("a\r\nb"));
+  expect(td.decode(disk.get("n.md")!)).toBe("new");
+});

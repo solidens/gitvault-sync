@@ -46,10 +46,13 @@ interface Push { path: string; token: string; prev: string | null; local: Local 
 
 /** Push rejected because GitHub moved (409/422): re-run the cycle (pull, merge, push) at most this often. */
 const MAX_SHA_RETRIES = 3;
+/** Refused compare-and-swap writes of an unchanged file before falling back to a byte check. */
+const MAX_REFUSALS = 3;
 
 export class SyncEngine {
   private tarball = new Map<string, string>(); // blob sha -> ciphertext from this cycle's tarball
   private unpushed = new Set<string>(); // paths of the current push not sent yet
+  private refused = new Map<string, { disk: string; n: number }>(); // path -> CAS refusals in a row while the disk stayed the same
   constructor(private d: EngineDeps) {}
 
   /** AuthError is rethrown (caller pauses); rate limits and persistent sha conflicts end the cycle with a report. */
@@ -83,6 +86,7 @@ export class SyncEngine {
     // records made with other keys: the user unlocked a vault re-created meanwhile, so this state describes nothing
     if (first && await pathToken(keys, first[0]) !== first[1].token) Object.assign(state, emptyState(), { filter: undefined, skipped: undefined, configSha: undefined });
     const fresh = state.headSha === null && Object.keys(state.files).length === 0;
+    if (fresh) state.rebinding = true; // survives an interrupted first cycle, which leaves some records behind
     const ignore = [...alwaysIgnored(settings.configDir, settings.pluginId), ...settings.ignore];
     const tooLarge = new Set<string>();
     const skip = (p: string) =>
@@ -172,7 +176,23 @@ export class SyncEngine {
     const taken = (q: string) => local.has(q) || remote.has(q) || !!state.files[q];
     // compare-and-swap write; null = the user changed the file meanwhile (deferred to the next cycle)
     const put = async (q: string, data: ArrayBuffer, expected: ArrayBuffer | null) => {
-      try { return await fs.write(q, data, expected); } catch (e) { if (e instanceof LocalChangedError) return null; throw e; }
+      try {
+        const st = await fs.write(q, data, expected);
+        this.refused.delete(q);
+        return st;
+      } catch (e) {
+        if (!(e instanceof LocalChangedError)) throw e;
+        const st = expected && await fs.stat(q);
+        if (!st) return null;
+        const disk = `${st.mtime}:${st.size}`, r = this.refused.get(q);
+        const n = r?.disk === disk ? r.n + 1 : 1;
+        this.refused.set(q, { disk, n });
+        // backstop: the editor-level check keeps refusing although the file on disk never changed (a text
+        // normalization we don't know about): fall back to a byte check and a plain write
+        if (n < MAX_REFUSALS || (await sha256Hex(await fs.read(q))) !== (await sha256Hex(expected))) return null;
+        this.refused.delete(q);
+        return fs.write(q, data);
+      }
     };
     const newPush = async (q: string, st: { mtime: number; size: number }, hash: string): Promise<Push> =>
       ({ path: q, token: await pathToken(keys, q), prev: null, local: { diskPath: q, mtime: st.mtime, size: st.size, hash } });
@@ -237,7 +257,7 @@ export class SyncEngine {
       }
       // remote changed and local unchanged, or (rebind without state only) local is an old remote version;
       // with state, a new local file matching an old version is a deliberate re-creation (e.g. renamed back), never stale
-      if (!localChanged || (!rec && fresh && await this.isOldVersion(rem.token, loc.hash))) {
+      if (!localChanged || (!rec && state.rebinding && await this.isOldVersion(rem.token, loc.hash))) {
         const cur = await this.scanned(loc);
         const st = cur && await put(loc.diskPath, data, cur);
         if (!st) { report.deferred.push(p); continue; }
@@ -262,7 +282,9 @@ export class SyncEngine {
         pushes.push({ path: p, token: rem.token, prev: rem.sha, local: { diskPath: loc.diskPath, mtime: st.mtime, size: st.size, hash: mh } });
         continue;
       }
-      // conflict copy: local version under a new name, remote keeps the path
+      // conflict copy: local version under a new name, remote keeps the path.
+      // CAS-check the target first (same bytes back): a user typing in it defers without leaving a copy behind
+      if (!(await put(loc.diskPath, mine, mine))) { report.deferred.push(p); continue; }
       const cp = await this.conflictName(p, taken);
       const cst = await put(cp, mine, null);
       if (!cst) { report.deferred.push(p); continue; }
@@ -297,6 +319,7 @@ export class SyncEngine {
     if (!head.notModified && deleteOk && !again && !report.deferred.length) {
       state.headSha = head.sha;
       state.refEtag = head.etag || null;
+      delete state.rebinding; // bind completed
     }
     await store.save(state);
 
