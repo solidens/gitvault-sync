@@ -2,6 +2,7 @@ import { expect, test, vi } from "vitest";
 import { TokenBucket } from "../src/bucket";
 import { AuthError, RateLimitError, ShaConflictError } from "../src/http";
 import { createVault } from "../src/crypto";
+import { SyncEngine, UNDECRYPTABLE } from "../src/engine";
 import { FakeGitHub } from "./fake-github";
 import { makeDevice, setupRepo, text } from "./helpers";
 
@@ -699,6 +700,7 @@ test("persistent sha conflict gives up after 3 retries without data loss", async
   const r = await B.engine.sync();
   expect(put).toHaveBeenCalledTimes(4);
   expect(r.pushed).toEqual([]);
+  expect(r.gaveUp).toEqual(["n.md"]);
   expect(await text(B.fs, "n.md")).toBe("a\nb\nC");
   expect((await B.engine.sync()).pushed).toEqual(["n.md"]);
   await A.engine.sync();
@@ -773,4 +775,86 @@ test("edit of a file deleted on GitHub is uploaded even when the first upload fa
   const C = makeDevice(fake, keys, "C");
   await C.engine.sync();
   expect(await text(C.fs, "x.md")).toBe("one\ntwo\n");
+});
+
+test("rebind: unreadable file history → conflict copy instead of a failed sync", async () => {
+  const { A, B } = await rebindSetup();
+  A.fs.set("n.md", "v2");
+  await A.engine.sync();
+  B.store.saved = null;
+  B.api.failNext("fileHistoryBlobShas", new Error("boom"));
+  expect((await B.engine.sync()).conflicts).toEqual(["n (conflict B 2026-10-27 1405).md"]);
+  expect(await text(B.fs, "n.md")).toBe("v2");
+});
+
+test("unexpected error mid-pull still saves the progress made so far", async () => {
+  const { A, B } = await pair({ "n1.md": "1", "n2.md": "2" });
+  A.fs.set("n1.md", "1b");
+  A.fs.set("n2.md", "2b");
+  await A.engine.sync();
+  const orig = B.api.getBlobText.bind(B.api);
+  let calls = 0;
+  B.api.getBlobText = async (sha) => {
+    if (++calls === 2) throw new Error("socket hang up");
+    return orig(sha);
+  };
+  await expect(B.engine.sync()).rejects.toThrow("socket hang up");
+  expect(await text(B.fs, "n1.md")).toBe("1b");
+  const reads = B.api.reads;
+  expect((await B.engine.sync()).pulled).toEqual(["n2.md"]);
+  expect(B.api.reads).toBe(reads + 3); // getHead, getTree, n2 only
+});
+
+test("undecryptable blob on GitHub → clear error", async () => {
+  const { fake, keys } = await setupRepo();
+  const other = (await createVault("pw2", 1000)).keys;
+  const X = makeDevice(fake, other, "X");
+  X.fs.set("x.md", "x");
+  await X.engine.sync();
+  await expect(makeDevice(fake, keys, "B").engine.sync()).rejects.toThrow(UNDECRYPTABLE);
+});
+
+test("gitvault.json replaced → clear error; unlocking the new vault resets the stale state", async () => {
+  const { fake, A } = await pair({ "n.md": "v1" });
+  const v2 = await createVault("new", 1000);
+  const tree = await fake.getTree(fake.head!), cfg = tree.get("gitvault.json")!;
+  for (const [rp, sha] of tree) if (rp.startsWith("f/")) await fake.deleteFile(rp, sha, "wipe"); // re-created over an emptied repo
+  await fake.putFile("gitvault.json", JSON.stringify(v2.config), cfg, "gvs: init");
+  await expect(A.engine.sync()).rejects.toThrow(UNDECRYPTABLE);
+  // the user re-enters the password: same disk and state, keys of the new vault
+  const A2 = new SyncEngine({
+    api: fake.client(), fs: A.fs, keys: v2.keys, store: A.store, deviceName: "A", settings: A.settings,
+    now: () => T, bucket: new TokenBucket(20, 4, () => T), confirmMassDelete: async () => false,
+  });
+  expect(await A2.sync()).toMatchObject({ pushed: ["n.md"], deleted: [], conflicts: [] });
+  const C = makeDevice(fake, v2.keys, "C");
+  await C.engine.sync();
+  expect(await text(C.fs, "n.md")).toBe("v1");
+});
+
+test("custom configDir: its plugin folder and workspace are ignored, config sync follows it", async () => {
+  const { fake, keys } = await setupRepo();
+  const settings = { configDir: ".obsidian-mobile" };
+  const A = makeDevice(fake, keys, "A", { settings: { ...settings, syncConfig: true } });
+  const B = makeDevice(fake, keys, "B", { settings });
+  for (const p of [".obsidian-mobile/plugins/gitvault-sync/state.json", ".obsidian-mobile/workspace.json", ".obsidian-mobile/app.json", "n.md"]) A.fs.set(p, "{}");
+  expect((await A.engine.sync()).pushed.sort()).toEqual([".obsidian-mobile/app.json", "n.md"]);
+  B.fs.set(".obsidian-mobile/app.json", "{}");
+  expect((await B.engine.sync()).pushed).toEqual([]);
+  expect(B.fs.paths()).toEqual([".obsidian-mobile/app.json", "n.md"]);
+});
+
+test("typing into the very file being pulled → write refused, deferred, then merged", async () => {
+  const { A, B } = await pair({ "x.md": "one\ntwo" });
+  A.fs.set("x.md", "ONE\ntwo");
+  await A.engine.sync();
+  B.fs.onBeforeWrite = (p) => {
+    if (p !== "x.md") return;
+    B.fs.onBeforeWrite = undefined;
+    B.fs.set("x.md", "one\ntwo typed");
+  };
+  expect((await B.engine.sync()).deferred).toEqual(["x.md"]);
+  expect(await text(B.fs, "x.md")).toBe("one\ntwo typed");
+  expect((await B.engine.sync()).conflicts).toEqual([]);
+  expect(await text(B.fs, "x.md")).toBe("ONE\ntwo typed");
 });

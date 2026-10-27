@@ -1,11 +1,12 @@
 // No Node APIs here: must run on iOS (WebCrypto, TextEncoder, btoa/atob only).
 
-export const ALWAYS_IGNORED = [
-  ".obsidian/plugins/gitvault-sync/**",
-  ".obsidian/workspace*.json",
+export const alwaysIgnored = (configDir: string, pluginId: string): string[] => [
+  `${configDir}/plugins/${pluginId}/**`,
+  `${configDir}/workspace*.json`,
   ".trash/**",
   ".git/**",
 ];
+export const ALWAYS_IGNORED = alwaysIgnored(".obsidian", "gitvault-sync");
 
 const bytes = (b: ArrayBuffer | Uint8Array) => (b instanceof Uint8Array ? b : new Uint8Array(b));
 const hex = (buf: ArrayBuffer) =>

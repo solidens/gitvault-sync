@@ -1,4 +1,4 @@
-import type { FileStat, LocalFs } from "../src/localfs";
+import { type FileStat, LocalChangedError, type LocalFs } from "../src/localfs";
 import type { StateStore, SyncState } from "../src/state";
 
 const nfc = (p: string) => p.normalize("NFC");
@@ -43,8 +43,13 @@ export class FakeFs implements LocalFs {
   async stat(path: string): Promise<FileStat | null> {
     return this.files.has(this.key(path)) ? this.st(this.key(path)) : null;
   }
-  async write(path: string, data: ArrayBuffer): Promise<FileStat> {
+  async write(path: string, data: ArrayBuffer, expected?: ArrayBuffer | null): Promise<FileStat> {
     await this.onBeforeWrite?.(nfc(path));
+    if (expected !== undefined) { // compare-and-swap, like vault.process against the editor's content
+      const cur = this.files.get(this.key(path))?.data;
+      const same = !cur || !expected ? !cur && !expected : Buffer.from(cur).equals(Buffer.from(expected));
+      if (!same) throw new LocalChangedError(path);
+    }
     this.put(path, data);
     return this.st(this.key(path));
   }

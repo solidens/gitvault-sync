@@ -2,10 +2,10 @@ import type { TokenBucket } from "./bucket";
 import { decryptFile, encryptFile, pathToken, type VaultKeys } from "./crypto";
 import type { GitHubApi } from "./github";
 import { AuthError, RateLimitError, ShaConflictError } from "./http";
-import type { LocalFs } from "./localfs";
+import { LocalChangedError, type LocalFs } from "./localfs";
 import { isMergeablePath, MAX_MERGE_BYTES, merge3, mergeJson, tryDecodeUtf8 } from "./merge";
 import { emptyState, type StateStore, type SyncState } from "./state";
-import { ALWAYS_IGNORED, conflictPath, gitBlobSha, isIgnored, nfc, repoPath, sha256Hex } from "./util";
+import { alwaysIgnored, conflictPath, gitBlobSha, isIgnored, nfc, repoPath, sha256Hex } from "./util";
 
 export interface EngineSettings {
   syncConfig: boolean; ignore: string[];
@@ -14,8 +14,11 @@ export interface EngineSettings {
   massDeletePercent: number;  // 20
   massDeleteMin: number;      // 10
   maxFileBytes: number;       // 50 * 1024 * 1024
+  configDir: string;          // app.vault.configDir, ".obsidian" by default
+  pluginId: string;           // manifest.id
 }
-export interface SyncReport { pulled: string[]; pushed: string[]; deleted: string[]; conflicts: string[]; deferred: string[]; skippedLarge: string[]; rateLimitedUntil?: number }
+/** gaveUp: local changes not sent because GitHub kept moving (sha conflicts); the next cycle tries again. */
+export interface SyncReport { pulled: string[]; pushed: string[]; deleted: string[]; conflicts: string[]; deferred: string[]; skippedLarge: string[]; gaveUp: string[]; rateLimitedUntil?: number }
 export interface EngineDeps {
   api: GitHubApi; fs: LocalFs; keys: VaultKeys; store: StateStore; deviceName: string;
   settings: EngineSettings; now: () => number; bucket: TokenBucket;
@@ -27,7 +30,11 @@ export const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
   batchThreshold: 5, tarballThreshold: 300,
   massDeletePercent: 20, massDeleteMin: 10,
   maxFileBytes: 50 * 1024 * 1024,
+  configDir: ".obsidian", pluginId: "gitvault-sync",
 };
+
+const CONFIG_FILE = "gitvault.json";
+export const UNDECRYPTABLE = "Файл на GitHub не расшифровывается — пароль или gitvault.json изменились";
 
 /** localHash of a remote file kept only as a conflict copy because its path differs from a local one only by case. */
 const CASE_COLLISION = "case-collision";
@@ -42,11 +49,12 @@ const MAX_SHA_RETRIES = 3;
 
 export class SyncEngine {
   private tarball = new Map<string, string>(); // blob sha -> ciphertext from this cycle's tarball
+  private unpushed = new Set<string>(); // paths of the current push not sent yet
   constructor(private d: EngineDeps) {}
 
   /** AuthError is rethrown (caller pauses); rate limits and persistent sha conflicts end the cycle with a report. */
   async sync(): Promise<SyncReport> {
-    const report: SyncReport = { pulled: [], pushed: [], deleted: [], conflicts: [], deferred: [], skippedLarge: [] };
+    const report: SyncReport = { pulled: [], pushed: [], deleted: [], conflicts: [], deferred: [], skippedLarge: [], gaveUp: [] };
     try {
       for (let retry = 0; ; retry++) {
         const state = (await this.d.store.load()) ?? emptyState();
@@ -54,15 +62,16 @@ export class SyncEngine {
           await this.cycle(state, report, retry > 0);
           return report;
         } catch (e) {
-          if (!(e instanceof ShaConflictError || e instanceof RateLimitError || e instanceof AuthError)) throw e;
-          await this.d.store.save(state); // every state change so far matches the disk
-          if (e instanceof AuthError) throw e;
+          // every state change so far matches the disk; a failing save must not hide the original error
+          await this.d.store.save(state).catch(() => {});
           if (e instanceof RateLimitError) return { ...report, rateLimitedUntil: e.resetAt };
-          if (retry === MAX_SHA_RETRIES) return report; // local content is on disk; next cycle tries again
+          if (!(e instanceof ShaConflictError)) throw e;
+          if (retry === MAX_SHA_RETRIES) return { ...report, gaveUp: [...this.unpushed] }; // local content is on disk; next cycle tries again
         }
       }
     } finally {
       this.tarball.clear();
+      this.unpushed.clear();
     }
   }
 
@@ -70,14 +79,17 @@ export class SyncEngine {
   private async cycle(state: SyncState, report: SyncReport, repoll: boolean): Promise<void> {
     const { api, fs, keys, store, settings } = this.d;
     report.deferred = []; report.skippedLarge = []; // describe the latest pass; the other lists accumulate across retries
+    const first = Object.entries(state.files)[0];
+    // records made with other keys: the user unlocked a vault re-created meanwhile, so this state describes nothing
+    if (first && await pathToken(keys, first[0]) !== first[1].token) Object.assign(state, emptyState(), { filter: undefined, skipped: undefined, configSha: undefined });
     const fresh = state.headSha === null && Object.keys(state.files).length === 0;
-    const ignore = [...ALWAYS_IGNORED, ...settings.ignore];
+    const ignore = [...alwaysIgnored(settings.configDir, settings.pluginId), ...settings.ignore];
     const tooLarge = new Set<string>();
     const skip = (p: string) =>
-      tooLarge.has(p) || isIgnored(p, ignore) || (!settings.syncConfig && p.startsWith(".obsidian/"));
+      tooLarge.has(p) || isIgnored(p, ignore) || (!settings.syncConfig && p.startsWith(settings.configDir + "/"));
 
     // Skip rules changed -> refetch the full tree so files that just became visible are seen as remote, not as new.
-    const filter = JSON.stringify([settings.syncConfig, settings.ignore, settings.maxFileBytes]);
+    const filter = JSON.stringify([settings.syncConfig, settings.ignore, settings.maxFileBytes, settings.configDir]);
     if (state.filter !== filter) {
       state.headSha = state.refEtag = null;
       state.filter = filter;
@@ -91,6 +103,12 @@ export class SyncEngine {
       base = head.sha;
       // a retry re-reads the tree even on an unchanged head: the conflict may come from a stale state record
       if (repoll || head.sha !== state.headSha) tree =head.sha === null ? new Map() : await api.getTree(head.sha);
+    }
+
+    if (tree) { // gitvault.json replaced (vault re-created elsewhere): our keys can't read the new files
+      const cfg = tree.get(CONFIG_FILE);
+      if (cfg && state.configSha && cfg !== state.configSha && Object.keys(state.files).length) throw new Error(UNDECRYPTABLE);
+      if (cfg) state.configSha = cfg;
     }
 
     // 2. Local scan: rehash only files whose mtime/size changed.
@@ -152,6 +170,10 @@ export class SyncEngine {
     const create = (h: string) => created.set(h, (created.get(h) ?? 0) + 1);
     let again = false; // something waits for the next cycle: keep the old head
     const taken = (q: string) => local.has(q) || remote.has(q) || !!state.files[q];
+    // compare-and-swap write; null = the user changed the file meanwhile (deferred to the next cycle)
+    const put = async (q: string, data: ArrayBuffer, expected: ArrayBuffer | null) => {
+      try { return await fs.write(q, data, expected); } catch (e) { if (e instanceof LocalChangedError) return null; throw e; }
+    };
     const newPush = async (q: string, st: { mtime: number; size: number }, hash: string): Promise<Push> =>
       ({ path: q, token: await pathToken(keys, q), prev: null, local: { diskPath: q, mtime: st.mtime, size: st.size, hash } });
     for (const p of new Set([...Object.keys(state.files), ...local.keys(), ...remote.keys()])) {
@@ -197,36 +219,41 @@ export class SyncEngine {
         }
         if (collides) { // writing would overwrite `other`
           const cp = await this.conflictName(p, taken);
-          const st = await fs.write(cp, data);
+          const st = await put(cp, data, null);
+          if (!st) { report.deferred.push(p); continue; }
           lower.set(cp.toLowerCase(), cp);
           state.files[p] = { token: rem.token, blobSha: rem.sha, localHash: CASE_COLLISION, mtime: -1, size: -1 };
           pushes.push(await newPush(cp, st, hash));
           report.conflicts.push(cp);
           continue;
         }
-        if (await this.changedSinceScan(p)) { report.deferred.push(p); continue; }
+        const st = await put(p, data, null);
+        if (!st) { report.deferred.push(p); continue; }
         if (!rec) create(hash);
-        synced(await fs.write(p, data));
+        synced(st);
         lower.set(p.toLowerCase(), p);
         report.pulled.push(p);
         continue;
       }
       if (!localChanged || (!rec && await this.isOldVersion(rem.token, loc.hash))) { // remote changed, local unchanged or an old remote version
-        if (await this.changedSinceScan(loc.diskPath, loc)) { report.deferred.push(p); continue; }
-        synced(await fs.write(loc.diskPath, data));
+        const cur = await this.scanned(loc);
+        const st = cur && await put(loc.diskPath, data, cur);
+        if (!st) { report.deferred.push(p); continue; }
+        synced(st);
         report.pulled.push(p);
         continue;
       }
 
       // changed on both sides
-      const mine = await fs.read(loc.diskPath);
+      const mine = await this.scanned(loc);
+      if (!mine) { report.deferred.push(p); continue; }
       const merged = await this.merge(p, rec?.blobSha, mine, data);
-      if (await this.changedSinceScan(loc.diskPath, loc)) { report.deferred.push(p); continue; }
       if (merged !== null) {
         const out = new TextEncoder().encode(merged).buffer as ArrayBuffer;
         const mh = await sha256Hex(out);
-        if (mh === hash) { synced(await fs.write(loc.diskPath, data)); report.pulled.push(p); continue; }
-        const st = mh === loc.hash ? loc : await fs.write(loc.diskPath, out);
+        const st = mh === loc.hash ? loc : await put(loc.diskPath, mh === hash ? data : out, mine);
+        if (!st) { report.deferred.push(p); continue; }
+        if (mh === hash) { synced(st); report.pulled.push(p); continue; }
         if (mh !== loc.hash) report.pulled.push(p);
         // base = remote; mtime -1 forces a rehash so the merge is re-pushed if this cycle's push doesn't happen
         state.files[p] = { token: rem.token, blobSha: rem.sha, localHash: hash, mtime: -1, size: -1 };
@@ -235,11 +262,14 @@ export class SyncEngine {
       }
       // conflict copy: local version under a new name, remote keeps the path
       const cp = await this.conflictName(p, taken);
-      const cst = await fs.write(cp, mine);
+      const cst = await put(cp, mine, null);
+      if (!cst) { report.deferred.push(p); continue; }
       lower.set(cp.toLowerCase(), cp);
-      synced(await fs.write(loc.diskPath, data));
       pushes.push(await newPush(cp, cst, loc.hash));
       report.conflicts.push(cp);
+      const st = await put(loc.diskPath, data, mine);
+      if (!st) { report.deferred.push(p); continue; } // the copy is pushed; p is merged again next cycle
+      synced(st);
       report.pulled.push(p);
     }
 
@@ -254,7 +284,7 @@ export class SyncEngine {
       || await this.d.confirmMassDelete(deletions.length, total);
     if (deleteOk) {
       for (const { p, loc } of trashes) {
-        if (await this.changedSinceScan(loc.diskPath, loc)) { report.deferred.push(p); continue; }
+        if (!(await this.scanned(loc))) { report.deferred.push(p); continue; }
         await fs.trash(loc.diskPath);
         report.deleted.push(p);
         delete state.files[p];
@@ -296,23 +326,26 @@ export class SyncEngine {
 
   /** Rebind without state: does the local file equal one of the last 20 remote versions (an outdated copy)? */
   private async isOldVersion(token: string, localHash: string): Promise<boolean> {
-    for (const sha of await this.d.api.fileHistoryBlobShas(repoPath(token), 20)) {
-      if ((await sha256Hex((await this.download(sha)).data)) === localHash) return true;
+    try {
+      for (const sha of await this.d.api.fileHistoryBlobShas(repoPath(token), 20)) {
+        if ((await sha256Hex((await this.download(sha)).data)) === localHash) return true;
+      }
+    } catch (e) {
+      if (e instanceof RateLimitError || e instanceof AuthError) throw e;
     }
-    return false;
+    return false; // unknown -> conflict copy, which loses nothing
   }
 
-  /** Disk differs from the scan (user typing, file created/removed meanwhile)? loc undefined = absent at scan. */
-  private async changedSinceScan(diskPath: string, loc?: Local): Promise<boolean> {
-    const st = await this.d.fs.stat(diskPath);
-    if (!loc || !st) return !!loc !== !!st;
-    if (st.mtime === loc.mtime && st.size === loc.size) return false;
-    return (await sha256Hex(await this.d.fs.read(diskPath))) !== loc.hash;
+  /** Current bytes of a scanned file, or null when they no longer match the scan (the user is editing it). */
+  private async scanned(loc: Local): Promise<ArrayBuffer | null> {
+    if (!(await this.d.fs.stat(loc.diskPath))) return null;
+    const cur = await this.d.fs.read(loc.diskPath);
+    return (await sha256Hex(cur)) === loc.hash ? cur : null;
   }
 
   /** Merged text, or null when a conflict copy is needed. Base = last synced blob; unfetchable base = no base. */
   private async merge(p: string, baseSha: string | undefined, mine: ArrayBuffer, theirs: ArrayBuffer): Promise<string | null> {
-    const json = p.startsWith(".obsidian/") && p.endsWith(".json");
+    const json = p.startsWith(this.d.settings.configDir + "/") && p.endsWith(".json");
     if (!(json || isMergeablePath(p)) || mine.byteLength > MAX_MERGE_BYTES || theirs.byteLength > MAX_MERGE_BYTES) return null;
     const local = tryDecodeUtf8(mine), remote = tryDecodeUtf8(theirs);
     if (local === null || remote === null) return null;
@@ -334,7 +367,9 @@ export class SyncEngine {
   }
 
   private async download(blobSha: string): Promise<{ path: string; data: ArrayBuffer }> {
-    const f = await decryptFile(this.d.keys, this.tarball.get(blobSha) ?? await this.d.api.getBlobText(blobSha));
+    const text = this.tarball.get(blobSha) ?? await this.d.api.getBlobText(blobSha);
+    let f: { path: string; data: ArrayBuffer };
+    try { f = await decryptFile(this.d.keys, text); } catch { throw new Error(UNDECRYPTABLE); }
     return { path: nfc(f.path), data: f.data };
   }
 
@@ -349,8 +384,10 @@ export class SyncEngine {
     const record = (x: Push, l: Local, blobSha: string, hash: string) => {
       state.files[x.path] = { token: x.token, blobSha, localHash: hash, mtime: l.mtime, size: l.size };
       report.pushed.push(x.path);
+      this.unpushed.delete(x.path);
     };
-    const forget = (x: Push) => { delete state.files[x.path]; report.deleted.push(x.path); };
+    const forget = (x: Push) => { delete state.files[x.path]; report.deleted.push(x.path); this.unpushed.delete(x.path); };
+    this.unpushed = new Set(pushes.map((x) => x.path));
     const limited = (n: number) => { report.rateLimitedUntil = now() + bucket.msUntil(n); };
 
     // Git Data API needs an existing commit, so an empty repo always goes file by file.
