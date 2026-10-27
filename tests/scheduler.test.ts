@@ -83,4 +83,11 @@ describe("Scheduler", () => {
     expect(h.timers.size).toBe(0);
     h.s.onLocalChange(); await h.advance(100_000); expect(h.runs).toEqual([]);
   });
+
+  it("runNow runs immediately unless stopped or paused", async () => {
+    const h = setup(); h.s.runNow(); await h.advance(0); expect(h.runs).toEqual([]);
+    h.s.start(); h.s.runNow(); await h.advance(0); expect(h.runs).toEqual([0]);
+    h.s.pauseUntil(5_000); h.s.runNow(); await h.advance(4_999); expect(h.runs).toEqual([0]);
+    await h.advance(1); expect(h.runs).toEqual([0, 5_000]);
+  });
 });

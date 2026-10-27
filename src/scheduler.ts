@@ -52,6 +52,11 @@ export class Scheduler {
     if (this.o.isVisible()) void this.attempt();
   }
 
+  /** "Sync now": same non-overlap and pause rules as scheduled runs. */
+  runNow(): void {
+    if (!this.stopped) void this.attempt();
+  }
+
   pauseUntil(ts: number): void {
     this.pausedUntil = ts;
   }

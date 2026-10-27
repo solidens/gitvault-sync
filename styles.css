@@ -1,1 +1,16 @@
 /* Gitvault Sync styles */
+.gvs-status { cursor: pointer; }
+.gvs-code {
+  font-family: var(--font-monospace);
+  font-size: 2em;
+  font-weight: 600;
+  letter-spacing: 0.15em;
+  text-align: center;
+  margin: 0.5em 0;
+  user-select: all;
+}
+.gvs-password { display: block; width: 100%; margin-bottom: 0.5em; }
+.gvs-error { color: var(--text-error); min-height: 1.2em; }
+.gvs-warn { color: var(--text-warning); }
+.gvs-events { padding-left: 1.2em; }
+.gvs-time { color: var(--text-muted); font-variant-numeric: tabular-nums; }
