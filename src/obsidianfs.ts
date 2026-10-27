@@ -73,8 +73,8 @@ export class ObsidianFs implements LocalFs {
 
 /** Atomic-ish: write state.json.tmp, then rename over state.json. */
 export class AdapterStateStore implements StateStore {
-  constructor(private adapter: DataAdapter, private dir: string) {}
-  private get file() { return `${this.dir}/state.json`; }
+  constructor(private adapter: DataAdapter, private dir: string, private name = "state.json") {}
+  private get file() { return `${this.dir}/${this.name}`; }
 
   async load(): Promise<SyncState | null> {
     try {

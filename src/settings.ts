@@ -94,7 +94,7 @@ export class GitvaultSettingTab extends PluginSettingTab {
           unlock(plugin, s.owner, s.repo, token).catch((e) => new Notice(`Gitvault Sync: ${errText(e)}`));
         }));
       }
-      row.addButton((b) => b.setButtonText("Выйти").setWarning().onClick(() => { plugin.signOut(); this.display(); }));
+      row.addButton((b) => b.setButtonText("Выйти").setWarning().onClick(async () => { await plugin.signOut(); this.display(); }));
     } else {
       new Setting(c).setName("1. Создать репозиторий").setDesc("Приватный репозиторий на GitHub; нажмите Create.")
         .addButton((b) => b.setButtonText("Создать").onClick(() => {
@@ -110,21 +110,24 @@ export class GitvaultSettingTab extends PluginSettingTab {
     }
 
     new Setting(c).setName("Синхронизация").setHeading();
+    // text fields save on "change" (blur/Enter), not per keystroke: each save rebuilds the engine
+    const onCommit = (el: HTMLInputElement | HTMLTextAreaElement, save: (v: string) => Promise<void>) =>
+      el.addEventListener("change", () => void save(el.value));
     new Setting(c).setName("Имя устройства").setDesc("Попадает в сообщения коммитов и имена конфликт-копий.")
-      .addText((t) => t.setValue(s.deviceName).onChange(async (v) => {
+      .addText((t) => onCommit(t.setValue(s.deviceName).inputEl, async (v) => {
         s.deviceName = v.trim() || defaultDeviceName();
         await plugin.saveSettings();
       }));
     new Setting(c).setName("Синхронизировать настройки и плагины").setDesc("Папка .obsidian; применится после перезапуска Obsidian.")
       .addToggle((t) => t.setValue(s.syncConfig).onChange(async (v) => { s.syncConfig = v; await plugin.saveSettings(); }));
     new Setting(c).setName("Игнорировать").setDesc("Шаблоны путей, по одному на строку, например Attachments/** или *.pdf")
-      .addTextArea((t) => t.setValue(s.ignore.join("\n")).onChange(async (v) => {
+      .addTextArea((t) => onCommit(t.setValue(s.ignore.join("\n")).inputEl, async (v) => {
         s.ignore = v.split("\n").map((l) => l.trim()).filter(Boolean);
         await plugin.saveSettings();
       }));
     new Setting(c).setName("Порог массового удаления, %")
       .setDesc("Если синхронизация удалит больше этой доли файлов (и больше 10 штук), она спросит подтверждение.")
-      .addText((t) => t.setValue(String(s.massDeletePercent)).onChange(async (v) => {
+      .addText((t) => onCommit(t.setValue(String(s.massDeletePercent)).inputEl, async (v) => {
         const n = Number(v);
         if (!Number.isInteger(n) || n < 1 || n > 100) return;
         s.massDeletePercent = n;

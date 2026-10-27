@@ -17,7 +17,7 @@ export class Scheduler {
   private poll: number | null = null;
   private resume: number | null = null;
   private firstEdit: number | null = null;
-  private running = false;
+  private running: Promise<void> | null = null; // the in-flight run
   private again = false;
   private stopped = true;
   private pausedUntil = 0;
@@ -29,12 +29,14 @@ export class Scheduler {
     this.armPoll();
   }
 
-  stop(): void {
+  /** Resolves once the in-flight run (if any) has finished. */
+  stop(): Promise<void> {
     this.stopped = true;
     this.again = false;
     this.firstEdit = null;
     for (const t of [this.debounce, this.poll, this.resume]) if (t !== null) this.o.clearTimer(t);
     this.debounce = this.poll = this.resume = null;
+    return this.running ?? Promise.resolve();
   }
 
   onLocalChange(): void {
@@ -76,10 +78,10 @@ export class Scheduler {
       return;
     }
     if (this.running) { this.again = true; return; }
-    this.running = true;
     this.firstEdit = null;
-    try { await this.o.run(); } catch { /* run() reports its own errors */ }
-    this.running = false;
+    this.running = this.o.run().catch(() => { /* run() reports its own errors */ });
+    await this.running;
+    this.running = null;
     if (this.again) { this.again = false; await this.attempt(); }
   }
 }

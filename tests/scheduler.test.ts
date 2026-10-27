@@ -90,4 +90,15 @@ describe("Scheduler", () => {
     h.s.pauseUntil(5_000); h.s.runNow(); await h.advance(4_999); expect(h.runs).toEqual([0]);
     await h.advance(1); expect(h.runs).toEqual([0, 5_000]);
   });
+
+  it("stop resolves only after the in-flight run finishes", async () => {
+    const h = setup(); h.block(); h.s.start(); h.s.runNow(); await h.advance(0);
+    let stopped = false;
+    void h.s.stop().then(() => { stopped = true; });
+    await Promise.resolve(); await Promise.resolve();
+    expect(stopped).toBe(false);
+    await h.finish(); await Promise.resolve(); await Promise.resolve();
+    expect(stopped).toBe(true);
+    expect(h.runs).toEqual([0]);
+  });
 });

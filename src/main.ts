@@ -1,4 +1,4 @@
-import { moment, Notice, Plugin, TFile } from "obsidian";
+import { moment, Notice, Platform, Plugin, TFile } from "obsidian";
 import { TokenBucket } from "./bucket";
 import { unlockVault, WrongPasswordError, type VaultKeys } from "./crypto";
 import { DEFAULT_ENGINE_SETTINGS, SyncEngine, type SyncReport } from "./engine";
@@ -12,6 +12,9 @@ import {
 } from "./settings";
 
 const MAX_EVENTS = 50;
+const RETRY_MIN_MS = 30_000;
+const RETRY_MAX_MS = 5 * 60_000;
+const MOBILE_NOTICE_EVERY_MS = 10 * 60_000;
 const hhmm = (ts: number) => moment(ts).format("HH:mm");
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
@@ -39,6 +42,11 @@ export default class GitvaultSync extends Plugin {
   private events: SyncEvent[] = [];
   private conflicts = new Set<string>();
   private warnedLarge = new Set<string>();
+  private initing = false;
+  private initRetryable = false; // last init failed on something transient (network, 5xx, rate limit)
+  private retryTimer: number | null = null;
+  private retryMs = RETRY_MIN_MS;
+  private noticedAt = new Map<string, number>(); // error message -> last mobile Notice
 
   async onload(): Promise<void> {
     this.settings = { ...DEFAULT_SETTINGS, ...(await this.loadData()) };
@@ -61,13 +69,17 @@ export default class GitvaultSync extends Plugin {
       this.registerEvent(this.app.vault.on("create", changed));
       this.registerEvent(this.app.vault.on("delete", changed));
       this.registerEvent(this.app.vault.on("rename", changed));
-      this.registerDomEvent(document, "visibilitychange", () => this.scheduler.onVisibilityChange());
+      this.registerDomEvent(document, "visibilitychange", () => {
+        if (!this.engine && this.initRetryable && document.visibilityState === "visible") void this.init();
+        else this.scheduler.onVisibilityChange();
+      });
       void this.init();
     });
   }
 
   onunload(): void {
-    this.scheduler.stop();
+    this.clearRetry();
+    void this.scheduler.stop();
   }
 
   token(): string | null {
@@ -88,17 +100,26 @@ export default class GitvaultSync extends Plugin {
     this.buildEngine();
   }
 
-  /** Startup (or retry): unlock with the remembered password, otherwise ask for it. */
+  /**
+   * Startup (or retry): unlock with the remembered password, otherwise ask for it.
+   * Transient failures retry with backoff and on returning to the app: on iOS the plugin
+   * often loads offline at a cold launch and then lives for days without a reload.
+   */
   private async init(): Promise<void> {
+    if (this.initing || this.engine) return;
+    this.clearRetry();
+    this.initRetryable = false;
     const token = this.token();
     const { owner, repo } = this.settings;
     if (!token || !owner) return this.setStatus("✗ не подключено");
     const password = this.app.loadLocalStorage(PASSWORD_KEY);
+    this.initing = true;
     try {
       if (!password) return await unlock(this, owner, repo, token);
       const config = await fetchVaultConfig(this.api()!);
       if (!config) throw new Error("в репозитории нет gitvault.json");
       this.keys = await unlockVault(password, config);
+      this.retryMs = RETRY_MIN_MS;
       this.buildEngine();
       this.start();
     } catch (e) {
@@ -108,16 +129,33 @@ export default class GitvaultSync extends Plugin {
         return void unlock(this, owner, repo, token).catch((err) => this.fail(err));
       }
       this.fail(e);
+      if (!(e instanceof AuthError)) this.scheduleRetry();
+    } finally {
+      this.initing = false;
     }
+  }
+
+  private scheduleRetry(): void {
+    this.initRetryable = true;
+    this.retryTimer = window.setTimeout(() => { this.retryTimer = null; void this.init(); }, this.retryMs);
+    this.retryMs = Math.min(this.retryMs * 2, RETRY_MAX_MS);
+  }
+
+  private clearRetry(): void {
+    if (this.retryTimer !== null) window.clearTimeout(this.retryTimer);
+    this.retryTimer = null;
   }
 
   async connect(c: { owner: string; repo: string; token: string; keys: VaultKeys; password: string; remember: boolean; created: boolean }): Promise<void> {
     const s = this.settings;
-    // State tracked for another repo or older keys would read as "everything was deleted remotely".
-    if (c.created || s.owner !== c.owner || s.repo !== c.repo) await this.resetState();
+    this.clearRetry();
+    this.initRetryable = false;
+    await this.scheduler.stop(); // an in-flight sync must not save its state after this point
+    Object.assign(s, { owner: c.owner, repo: c.repo, rememberPassword: c.remember });
+    // State is per repo; a new vault has new keys, so its old state would read as "everything was deleted remotely".
+    if (c.created) await this.resetState();
     this.app.saveLocalStorage(TOKEN_KEY, c.token);
     this.app.saveLocalStorage(PASSWORD_KEY, c.remember ? c.password : null);
-    Object.assign(s, { owner: c.owner, repo: c.repo, rememberPassword: c.remember });
     this.keys = c.keys;
     await this.saveSettings();
     this.log(`Подключено к ${c.owner}/${c.repo}`);
@@ -125,11 +163,13 @@ export default class GitvaultSync extends Plugin {
   }
 
   /** Forgets the secrets; the sync state stays so signing in again resumes without a full re-scan. */
-  signOut(): void {
+  async signOut(): Promise<void> {
     this.app.saveLocalStorage(TOKEN_KEY, null);
     this.app.saveLocalStorage(PASSWORD_KEY, null);
-    this.scheduler.stop();
+    this.clearRetry();
+    this.initRetryable = false;
     this.keys = this.engine = null;
+    await this.scheduler.stop();
     this.setStatus("✗ не подключено");
   }
 
@@ -137,8 +177,13 @@ export default class GitvaultSync extends Plugin {
     return `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
   }
 
+  /** One state file per repo (GitHub names are [A-Za-z0-9._-] and case-insensitive). */
+  private get stateFile(): string {
+    return `state-${`${this.settings.owner}__${this.settings.repo}`.toLowerCase().replace(/[^a-z0-9._-]/g, "_")}.json`;
+  }
+
   private async resetState(): Promise<void> {
-    const f = `${this.stateDir}/state.json`;
+    const f = `${this.stateDir}/${this.stateFile}`;
     if (await this.app.vault.adapter.exists(f)) await this.app.vault.adapter.remove(f);
   }
 
@@ -149,7 +194,7 @@ export default class GitvaultSync extends Plugin {
     const s = this.settings;
     this.engine = new SyncEngine({
       api, fs: new ObsidianFs(this.app), keys: this.keys,
-      store: new AdapterStateStore(this.app.vault.adapter, this.stateDir),
+      store: new AdapterStateStore(this.app.vault.adapter, this.stateDir, this.stateFile),
       deviceName: s.deviceName,
       settings: { ...DEFAULT_ENGINE_SETTINGS, syncConfig: s.syncConfig, ignore: s.ignore, massDeletePercent: s.massDeletePercent },
       now: Date.now, bucket: this.bucket,
@@ -174,7 +219,7 @@ export default class GitvaultSync extends Plugin {
   private togglePause(): void {
     this.paused = !this.paused;
     if (this.paused) {
-      this.scheduler.stop();
+      void this.scheduler.stop();
       this.setStatus("⏸ пауза");
     } else this.start();
   }
@@ -209,20 +254,27 @@ export default class GitvaultSync extends Plugin {
     }
     if (r.rateLimitedUntil) {
       this.scheduler.pauseUntil(r.rateLimitedUntil);
-      this.setStatus(`⏸ лимит GitHub до ${hhmm(r.rateLimitedUntil)}`);
       this.log(`Лимит GitHub, пауза до ${hhmm(r.rateLimitedUntil)}`);
+      if (!this.paused) this.setStatus(`⏸ лимит GitHub до ${hhmm(r.rateLimitedUntil)}`);
       return;
     }
     // a conflict counts until the user deletes its copy
     for (const p of this.conflicts) if (!this.app.vault.getAbstractFileByPath(p)) this.conflicts.delete(p);
-    this.setStatus(this.conflicts.size ? conflictsLabel(this.conflicts.size) : `✓ ${hhmm(Date.now())}`);
+    if (!this.paused) this.setStatus(this.conflicts.size ? conflictsLabel(this.conflicts.size) : `✓ ${hhmm(Date.now())}`);
   }
 
   private fail(e: unknown): void {
-    if (e instanceof AuthError) this.scheduler.stop();
+    if (e instanceof AuthError) void this.scheduler.stop();
     const msg = e instanceof AuthError ? "войдите снова" : errText(e);
-    this.setStatus(`✗ ${msg}`);
     this.log(`Ошибка: ${msg}`);
+    if (this.paused) return;
+    this.setStatus(`✗ ${msg}`);
+    // no status bar on mobile: surface errors as a Notice, at most once per message per 10 min
+    const last = this.noticedAt.get(msg) ?? -Infinity;
+    if (Platform.isMobile && Date.now() - last >= MOBILE_NOTICE_EVERY_MS) {
+      this.noticedAt.set(msg, Date.now());
+      new Notice(`Gitvault Sync: ✗ ${msg}`);
+    }
   }
 
   private log(text: string, path?: string): void {
