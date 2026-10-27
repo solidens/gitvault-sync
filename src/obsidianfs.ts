@@ -1,6 +1,20 @@
 import { TFile, type App, type DataAdapter } from "obsidian";
-import type { FileStat, LocalFs } from "./localfs";
+import { type FileStat, LocalChangedError, type LocalFs } from "./localfs";
 import type { StateStore, SyncState } from "./state";
+
+/** Text that vault.process can hand back byte for byte: valid UTF-8 without a BOM (which a text read may drop). */
+function exactText(b: ArrayBuffer): string | null {
+  try {
+    const s = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(b);
+    return s.startsWith("\uFEFF") ? null : s;
+  } catch {
+    return null;
+  }
+}
+function sameBytes(a: ArrayBuffer, b: ArrayBuffer): boolean {
+  const x = new Uint8Array(a), y = new Uint8Array(b);
+  return x.length === y.length && x.every((v, i) => v === y[i]);
+}
 
 export class ObsidianFs implements LocalFs {
   constructor(private app: App) {}
@@ -41,10 +55,20 @@ export class ObsidianFs implements LocalFs {
     return st && st.type === "file" ? { path, mtime: st.mtime, size: st.size } : null;
   }
 
-  async write(path: string, data: ArrayBuffer): Promise<FileStat> {
+  async write(path: string, data: ArrayBuffer, expected?: ArrayBuffer | null): Promise<FileStat> {
     const existing = this.file(path);
-    if (existing) await this.app.vault.modifyBinary(existing, data);
-    else {
+    if (expected === null && (existing || await this.adapter.exists(path))) throw new LocalChangedError(path);
+    const text = existing && expected ? exactText(data) : null, want = text !== null && expected ? exactText(expected) : null;
+    if (existing && text !== null && want !== null) {
+      // atomic against the editor: an open note's unsaved typing makes `cur` differ and the write is refused
+      await this.app.vault.process(existing, (cur) => { if (cur !== want) throw new LocalChangedError(path); return text; });
+    } else if (existing) {
+      // shortcut: binary files have no atomic compare-and-swap; this check leaves a tiny window
+      if (expected && !sameBytes(await this.adapter.readBinary(path), expected)) throw new LocalChangedError(path);
+      await this.app.vault.modifyBinary(existing, data);
+    } else {
+      // not in the vault index (config files): plain compare before the write
+      if (expected && !((await this.adapter.exists(path)) && sameBytes(await this.adapter.readBinary(path), expected))) throw new LocalChangedError(path);
       await this.mkdirs(path);
       if (this.isConfig(path)) await this.adapter.writeBinary(path, data); // not indexed by the vault
       else await this.app.vault.createBinary(path, data);
@@ -76,14 +100,16 @@ export class AdapterStateStore implements StateStore {
   constructor(private adapter: DataAdapter, private dir: string, private name = "state.json") {}
   private get file() { return `${this.dir}/${this.name}`; }
 
+  /** Falls back to state.json.tmp: save() may have died between removing state.json and the rename. */
   async load(): Promise<SyncState | null> {
-    try {
-      if (!(await this.adapter.exists(this.file))) return null;
-      const s = JSON.parse(await this.adapter.read(this.file)) as SyncState;
-      return s?.version === 1 ? s : null;
-    } catch {
-      return null; // corrupt state => treated as first sync
+    for (const f of [this.file, `${this.file}.tmp`]) {
+      try {
+        if (!(await this.adapter.exists(f))) continue;
+        const s = JSON.parse(await this.adapter.read(f)) as SyncState;
+        if (s?.version === 1) return s;
+      } catch { /* corrupt: try the next one */ }
     }
+    return null; // treated as first sync
   }
 
   async save(s: SyncState): Promise<void> {
