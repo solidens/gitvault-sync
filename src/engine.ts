@@ -102,7 +102,7 @@ export class SyncEngine {
     if (!head.notModified) {
       base = head.sha;
       // a retry re-reads the tree even on an unchanged head: the conflict may come from a stale state record
-      if (repoll || head.sha !== state.headSha) tree =head.sha === null ? new Map() : await api.getTree(head.sha);
+      if (repoll || head.sha !== state.headSha) tree = head.sha === null ? new Map() : await api.getTree(head.sha);
     }
 
     if (tree) { // gitvault.json replaced (vault re-created elsewhere): our keys can't read the new files
