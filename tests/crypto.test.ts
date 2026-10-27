@@ -13,12 +13,12 @@ test("roundtrip with path", async () => {
   expect(dec(r.data)).toBe("привет");
 });
 test("unlock with right/wrong password", async () => {
-  const { config } = await createVault("pw", 1000);
+  const { config } = await createVault("pw", 100_000);
   await expect(unlockVault("pw", config)).resolves.toBeDefined();
   await expect(unlockVault("nope", config)).rejects.toBeInstanceOf(WrongPasswordError);
 });
 test("same keys from unlock decrypt", async () => {
-  const { config, keys } = await createVault("pw", 1000);
+  const { config, keys } = await createVault("pw", 100_000);
   const t = await encryptFile(keys, "a.md", enc("x"));
   const k2 = await unlockVault("pw", config);
   expect(dec((await decryptFile(k2, t)).data)).toBe("x");
@@ -41,4 +41,12 @@ test("tampered ciphertext rejected", async () => {
 test("ciphertext is randomized", async () => {
   const { keys } = await createVault("pw", 1000);
   expect(await encryptFile(keys, "a.md", enc("x"))).not.toBe(await encryptFile(keys, "a.md", enc("x")));
+});
+test("config uses PBKDF2+HKDF; unlock refuses unknown format, alg or iteration counts", async () => {
+  const { config } = await createVault("pw", 100_000);
+  expect(config.kdf.alg).toBe("PBKDF2-SHA256+HKDF");
+  const bad = (patch: object, kdf: object = {}) => unlockVault("pw", { ...config, ...patch, kdf: { ...config.kdf, ...kdf } } as never);
+  await expect(bad({ format: 2 })).rejects.toThrow("формат");
+  await expect(bad({}, { alg: "PBKDF2-SHA256" })).rejects.toThrow("алгоритм");
+  for (const iterations of [99_999, 10_000_001, 1.5]) await expect(bad({}, { iterations })).rejects.toThrow("итераций");
 });

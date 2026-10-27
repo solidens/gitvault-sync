@@ -25,7 +25,7 @@ function rig() {
   };
   const vault = {
     adapter, configDir: ".obsidian",
-    getAbstractFileByPath: (p: string) => (disk.has(p) && !p.startsWith(".obsidian/") ? new TFile(p) : null),
+    getAbstractFileByPath: (p: string) => (disk.has(p) && !p.startsWith(".obsidian/") ? Object.assign(new TFile(), { path: p }) : null),
     process: async (f: TFile, fn: (s: string) => string) => {
       calls.push(`process ${f.path}`);
       const out = fn(editor.get(f.path) ?? td.decode(disk.get(f.path)!));

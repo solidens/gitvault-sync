@@ -3,7 +3,7 @@ import { b64decode, b64encode, nfc } from "./util";
 
 export interface VaultConfig {
   format: 1;
-  kdf: { alg: "PBKDF2-SHA256"; iterations: number; salt: string };
+  kdf: { alg: typeof KDF_ALG; iterations: number; salt: string };
   kcv: string;
 }
 export interface VaultKeys { enc: CryptoKey; mac: CryptoKey }
@@ -11,6 +11,9 @@ export class WrongPasswordError extends Error {
   constructor() { super("Wrong password"); this.name = "WrongPasswordError"; }
 }
 
+/** PBKDF2-SHA256 -> 256-bit master -> HKDF-SHA256 per purpose (AES key, HMAC key). */
+const KDF_ALG = "PBKDF2-SHA256+HKDF";
+const MIN_ITERATIONS = 100_000, MAX_ITERATIONS = 10_000_000;
 const MAGIC = new TextEncoder().encode("GVS1");
 const KCV_PLAIN = "gvs-key-check-v1";
 const IV_LEN = 12;
@@ -19,11 +22,12 @@ const bs = (u: Uint8Array) => u as BufferSource;
 
 async function deriveKeys(password: string, salt: Uint8Array, iterations: number): Promise<VaultKeys> {
   const base = await crypto.subtle.importKey("raw", bs(te.encode(password)), "PBKDF2", false, ["deriveBits"]);
-  const bits = new Uint8Array(await crypto.subtle.deriveBits(
-    { name: "PBKDF2", hash: "SHA-256", salt: bs(salt), iterations }, base, 512));
+  const master = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: bs(salt), iterations }, base, 256);
+  const hk = await crypto.subtle.importKey("raw", master, "HKDF", false, ["deriveKey"]);
+  const info = (label: string) => ({ name: "HKDF", hash: "SHA-256", salt: bs(new Uint8Array(0)), info: bs(te.encode(label)) });
   return {
-    enc: await crypto.subtle.importKey("raw", bs(bits.slice(0, 32)), "AES-GCM", false, ["encrypt", "decrypt"]),
-    mac: await crypto.subtle.importKey("raw", bs(bits.slice(32)), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
+    enc: await crypto.subtle.deriveKey(info("gvs-enc-v1"), hk, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]),
+    mac: await crypto.subtle.deriveKey(info("gvs-mac-v1"), hk, { name: "HMAC", hash: "SHA-256", length: 256 }, false, ["sign"]),
   };
 }
 
@@ -50,13 +54,18 @@ export async function createVault(password: string, iterations = 600_000) {
   const keys = await deriveKeys(password, salt, iterations);
   const config: VaultConfig = {
     format: 1,
-    kdf: { alg: "PBKDF2-SHA256", iterations, salt: b64encode(salt) },
+    kdf: { alg: KDF_ALG, iterations, salt: b64encode(salt) },
     kcv: await seal(keys, te.encode(KCV_PLAIN)),
   };
   return { config, keys };
 }
 
+/** config comes from the repo: anything unexpected is refused before spending CPU on it. */
 export async function unlockVault(password: string, config: VaultConfig): Promise<VaultKeys> {
+  if (config?.format !== 1) throw new Error("gitvault.json: неизвестный формат");
+  if (config.kdf?.alg !== KDF_ALG) throw new Error(`gitvault.json: неподдерживаемый алгоритм ключа ${String(config.kdf?.alg)}`);
+  const n = config.kdf.iterations;
+  if (!Number.isInteger(n) || n < MIN_ITERATIONS || n > MAX_ITERATIONS) throw new Error(`gitvault.json: недопустимое число итераций ${n}`);
   const keys = await deriveKeys(password, b64decode(config.kdf.salt), config.kdf.iterations);
   try {
     if (new TextDecoder().decode(await open(keys, config.kcv)) === KCV_PLAIN) return keys;
