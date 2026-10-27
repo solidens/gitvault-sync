@@ -1,3 +1,5 @@
+import { requestUrl } from "obsidian";
+
 export interface HttpRequest { url: string; method: string; headers?: Record<string, string>; body?: string | ArrayBuffer }
 export interface HttpResponse { status: number; headers: Record<string, string>; text: string; arrayBuffer: ArrayBuffer }
 export type Http = (req: HttpRequest) => Promise<HttpResponse>;
@@ -14,3 +16,8 @@ export class AuthError extends Error {
 export class ShaConflictError extends Error {
   constructor(public path?: string, message = "sha conflict") { super(message); this.name = "ShaConflictError"; }
 }
+
+export const obsidianHttp: Http = async (req) => {
+  const r = await requestUrl({ url: req.url, method: req.method, headers: req.headers, body: req.body, throw: false });
+  return { status: r.status, headers: r.headers, text: r.text, arrayBuffer: r.arrayBuffer };
+};
