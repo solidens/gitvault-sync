@@ -2,8 +2,9 @@ import type { TokenBucket } from "./bucket";
 import { decryptFile, encryptFile, pathToken, type VaultKeys } from "./crypto";
 import type { GitHubApi } from "./github";
 import type { LocalFs } from "./localfs";
+import { isMergeablePath, MAX_MERGE_BYTES, merge3, mergeJson, tryDecodeUtf8 } from "./merge";
 import { emptyState, type StateStore, type SyncState } from "./state";
-import { ALWAYS_IGNORED, gitBlobSha, isIgnored, nfc, repoPath, sha256Hex } from "./util";
+import { ALWAYS_IGNORED, conflictPath, gitBlobSha, isIgnored, nfc, repoPath, sha256Hex } from "./util";
 
 export interface EngineSettings {
   syncConfig: boolean; ignore: string[];
@@ -26,6 +27,9 @@ export const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
   massDeletePercent: 20, massDeleteMin: 10,
   maxFileBytes: 50 * 1024 * 1024,
 };
+
+/** localHash of a remote file kept only as a conflict copy because its path differs from a local one only by case. */
+const CASE_COLLISION = "case-collision";
 
 interface Local { diskPath: string; mtime: number; size: number; hash: string }
 interface Remote { token: string; sha: string; data?: ArrayBuffer }
@@ -103,8 +107,20 @@ export class SyncEngine {
     }
     state.skipped = skipped;
 
-    // 3. Pull / decide pushes.
-    const pushes: Push[] = [];
+    // Empty-storage rule: one side empty while we tracked many files is a first load, never "everything was deleted".
+    const total = Object.keys(state.files).length;
+    if (total > settings.massDeleteMin && ((tree && remoteTokens.size === 0 && local.size > 0) || (local.size === 0 && remoteTokens.size > 0))) {
+      state.files = {};
+    }
+
+    // 3. Pull / decide pushes. Deletions are collected and run after the mass-delete guard.
+    let pushes: Push[] = [];
+    const trashes: { p: string; loc: Local }[] = [];
+    const created = new Set<string>(); // localHash of files new this cycle: a deletion with a matching creation is a rename
+    const lower = new Map([...local.keys()].map((q) => [q.toLowerCase(), q]));
+    const taken = (q: string) => local.has(q) || remote.has(q) || !!state.files[q];
+    const newPush = async (q: string, st: { mtime: number; size: number }, hash: string): Promise<Push> =>
+      ({ path: q, token: await pathToken(keys, q), prev: null, local: { diskPath: q, mtime: st.mtime, size: st.size, hash } });
     for (const p of new Set([...Object.keys(state.files), ...local.keys(), ...remote.keys()])) {
       if (skip(p)) continue;
       const rec = state.files[p], loc = local.get(p);
@@ -113,35 +129,91 @@ export class SyncEngine {
         const token = await pathToken(keys, p), sha = remoteTokens.get(token);
         if (sha !== undefined) rem = { token, sha };
       }
-      const localChanged = rec ? loc?.hash !== rec.localHash : !!loc;
+      // a case-collision record was never on disk under this path, so its absence is not a local delete
+      const localChanged = rec ? !(rec.localHash === CASE_COLLISION && !loc) && loc?.hash !== rec.localHash : !!loc;
       const remoteChanged = rec ? rem?.sha !== rec.blobSha : !!rem;
       if (!localChanged && !remoteChanged) continue;
 
       if (!remoteChanged) {
+        if (!rec && loc) created.add(loc.hash);
         pushes.push({ path: p, token: rec?.token ?? await pathToken(keys, p), prev: rem?.sha ?? null, local: loc ?? null });
         continue;
       }
       if (!rem) { // deleted on GitHub (rec exists)
         if (loc && localChanged) pushes.push({ path: p, token: rec!.token, prev: null, local: loc }); // edit beats delete
-        else {
-          if (loc) { await fs.trash(loc.diskPath); report.deleted.push(p); }
-          delete state.files[p];
-        }
+        else if (loc) trashes.push({ p, loc });
+        else delete state.files[p];
         continue;
       }
       const data = rem.data ?? (await this.download(rem.sha)).data;
       const hash = await sha256Hex(data);
-      if (loc && hash === loc.hash) { // both sides already agree (e.g. crash after PUT before state save)
-        state.files[p] = { token: rem.token, blobSha: rem.sha, localHash: hash, mtime: loc.mtime, size: loc.size };
+      const synced = (st: { mtime: number; size: number }) =>
+        state.files[p] = { token: rem.token, blobSha: rem.sha, localHash: hash, mtime: st.mtime, size: st.size };
+      if (loc && hash === loc.hash) { synced(loc); continue; } // both sides already agree (e.g. crash after PUT before state save)
+
+      if (!loc) { // new on GitHub, or edited there and deleted here (edit beats delete)
+        const other = lower.get(p.toLowerCase());
+        if (other && other !== p) { // would overwrite `other` on a case-insensitive disk
+          const cp = await this.conflictName(p, taken);
+          const st = await fs.write(cp, data);
+          state.files[p] = { token: rem.token, blobSha: rem.sha, localHash: CASE_COLLISION, mtime: -1, size: -1 };
+          pushes.push(await newPush(cp, st, hash));
+          report.conflicts.push(cp);
+          continue;
+        }
+        if (await this.changedSinceScan(p)) { report.deferred.push(p); continue; }
+        if (!rec) created.add(hash);
+        synced(await fs.write(p, data));
+        report.pulled.push(p);
         continue;
       }
-      if (loc && localChanged) throw new Error("conflict: Task 9");
-      // remote changed, local unchanged or deleted locally (edit beats delete)
-      const st = await fs.write(loc?.diskPath ?? p, data);
-      state.files[p] = { token: rem.token, blobSha: rem.sha, localHash: hash, mtime: st.mtime, size: st.size };
+      if (!localChanged) { // remote changed, local unchanged
+        if (await this.changedSinceScan(loc.diskPath, loc)) { report.deferred.push(p); continue; }
+        synced(await fs.write(loc.diskPath, data));
+        report.pulled.push(p);
+        continue;
+      }
+
+      // changed on both sides
+      const mine = await fs.read(loc.diskPath);
+      const merged = await this.merge(p, rec?.blobSha, mine, data);
+      if (await this.changedSinceScan(loc.diskPath, loc)) { report.deferred.push(p); continue; }
+      if (merged !== null) {
+        const out = new TextEncoder().encode(merged).buffer as ArrayBuffer;
+        const mh = await sha256Hex(out);
+        if (mh === hash) { synced(await fs.write(loc.diskPath, data)); report.pulled.push(p); continue; }
+        const st = mh === loc.hash ? loc : await fs.write(loc.diskPath, out);
+        if (mh !== loc.hash) report.pulled.push(p);
+        // base = remote; mtime -1 forces a rehash so the merge is re-pushed if this cycle's push doesn't happen
+        state.files[p] = { token: rem.token, blobSha: rem.sha, localHash: hash, mtime: -1, size: -1 };
+        pushes.push({ path: p, token: rem.token, prev: rem.sha, local: { diskPath: loc.diskPath, mtime: st.mtime, size: st.size, hash: mh } });
+        continue;
+      }
+      // conflict copy: local version under a new name, remote keeps the path
+      const cp = await this.conflictName(p, taken);
+      const cst = await fs.write(cp, mine);
+      synced(await fs.write(loc.diskPath, data));
+      pushes.push(await newPush(cp, cst, loc.hash));
+      report.conflicts.push(cp);
       report.pulled.push(p);
     }
-    if (!head.notModified) {
+
+    // Mass-delete guard (both directions); renames don't count.
+    const deletions = [...trashes.map((t) => t.p), ...pushes.filter((x) => !x.local).map((x) => x.path)]
+      .filter((p) => !created.has(state.files[p].localHash));
+    const deleteOk = !(deletions.length > total * settings.massDeletePercent / 100 && deletions.length > settings.massDeleteMin)
+      || await this.d.confirmMassDelete(deletions.length, total);
+    if (deleteOk) {
+      for (const { p, loc } of trashes) {
+        if (await this.changedSinceScan(loc.diskPath, loc)) { report.deferred.push(p); continue; }
+        await fs.trash(loc.diskPath);
+        report.deleted.push(p);
+        delete state.files[p];
+      }
+    } else pushes = pushes.filter((x) => x.local);
+
+    // Keep the old head when something was put off, so the next cycle sees those remote changes again.
+    if (!head.notModified && deleteOk && !report.deferred.length) {
       state.headSha = head.sha;
       state.refEtag = head.etag || null;
     }
@@ -150,6 +222,37 @@ export class SyncEngine {
     // 4. Push.
     if (pushes.length) await this.push(state, pushes, base, report);
     return report;
+  }
+
+  /** Disk differs from the scan (user typing, file created/removed meanwhile)? loc undefined = absent at scan. */
+  private async changedSinceScan(diskPath: string, loc?: Local): Promise<boolean> {
+    const st = await this.d.fs.stat(diskPath);
+    if (!loc || !st) return !!loc !== !!st;
+    if (st.mtime === loc.mtime && st.size === loc.size) return false;
+    return (await sha256Hex(await this.d.fs.read(diskPath))) !== loc.hash;
+  }
+
+  /** Merged text, or null when a conflict copy is needed. Base = last synced blob; unfetchable base = no base. */
+  private async merge(p: string, baseSha: string | undefined, mine: ArrayBuffer, theirs: ArrayBuffer): Promise<string | null> {
+    const json = p.startsWith(".obsidian/") && p.endsWith(".json");
+    if (!(json || isMergeablePath(p)) || mine.byteLength > MAX_MERGE_BYTES || theirs.byteLength > MAX_MERGE_BYTES) return null;
+    const local = tryDecodeUtf8(mine), remote = tryDecodeUtf8(theirs);
+    if (local === null || remote === null) return null;
+    let base: string | null = null;
+    if (baseSha !== undefined) {
+      try { base = tryDecodeUtf8((await this.download(baseSha)).data); } catch { base = null; }
+    }
+    if (json) return mergeJson(base, local, remote);
+    return base === null ? null : merge3(base, local, remote);
+  }
+
+  private async conflictName(p: string, taken: (q: string) => boolean): Promise<string> {
+    const c = nfc(conflictPath(p, this.d.deviceName, new Date(this.d.now())));
+    const i = c.lastIndexOf(")");
+    for (let n = 1; ; n++) {
+      const q = n === 1 ? c : `${c.slice(0, i + 1)} ${n}${c.slice(i + 1)}`;
+      if (!taken(q) && !(await this.d.fs.stat(q))) return q;
+    }
   }
 
   private async download(blobSha: string): Promise<{ path: string; data: ArrayBuffer }> {

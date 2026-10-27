@@ -224,24 +224,11 @@ test("bucket exhausted defers pushes", async () => {
   expect(fTree(fake)).toHaveLength(5);
 });
 
-test("genuinely different edits on both sides throw until Task 9", async () => {
-  const { fake, keys } = await setupRepo();
-  const A = makeDevice(fake, keys, "A"), B = makeDevice(fake, keys, "B");
-  A.fs.set("n.md", "v1");
-  await A.engine.sync();
-  await B.engine.sync();
-  A.fs.set("n.md", "a");
-  B.fs.set("n.md", "b");
-  await A.engine.sync();
-  await expect(B.engine.sync()).rejects.toThrow("conflict: Task 9");
-  expect(await text(B.fs, "n.md")).toBe("b");
-});
-
 async function toggleSetup(bContent: string) {
   const { fake, keys } = await setupRepo();
   const A = makeDevice(fake, keys, "A", { settings: { syncConfig: true } });
   const B = makeDevice(fake, keys, "B");
-  for (let i = 0; i < 6; i++) A.fs.set(`.obsidian/c${i}.json`, "A");
+  for (let i = 0; i < 6; i++) A.fs.set(`.obsidian/c${i}.json`, '{"x":"A","a":1}');
   await A.engine.sync();
   for (let i = 0; i < 6; i++) B.fs.set(`.obsidian/c${i}.json`, bContent);
   B.fs.set("n.md", "n");
@@ -252,19 +239,18 @@ async function toggleSetup(bContent: string) {
   return { fake, keys, B };
 }
 
-test("turning syncConfig on never overwrites other devices' config", async () => {
-  const { fake, keys, B } = await toggleSetup("B");
-  const writes = fake.totalWrites;
-  await expect(B.engine.sync()).rejects.toThrow("conflict: Task 9");
-  expect(fake.totalWrites).toBe(writes);
-  expect(await text(B.fs, ".obsidian/c0.json")).toBe("B");
+test("turning syncConfig on merges config key-wise, remote wins on dispute", async () => {
+  const { fake, keys, B } = await toggleSetup('{"x":"B","b":2}');
+  expect((await B.engine.sync()).conflicts).toEqual([]);
   const C = makeDevice(fake, keys, "C", { settings: { syncConfig: true } });
   await C.engine.sync();
-  for (let i = 0; i < 6; i++) expect(await text(C.fs, `.obsidian/c${i}.json`)).toBe("A");
+  for (const d of [B, C]) {
+    for (let i = 0; i < 6; i++) expect(JSON.parse(await text(d.fs, `.obsidian/c${i}.json`))).toEqual({ x: "A", a: 1, b: 2 });
+  }
 });
 
 test("turning syncConfig on with identical config only records state", async () => {
-  const { fake, B } = await toggleSetup("A");
+  const { fake, B } = await toggleSetup('{"x":"A","a":1}');
   const writes = fake.totalWrites;
   expect(await B.engine.sync()).toMatchObject({ pushed: [], pulled: [] });
   expect(fake.totalWrites).toBe(writes);
@@ -282,10 +268,12 @@ test("removing an ignore pattern never overwrites the remote file", async () => 
   await B.engine.sync();
   await B.engine.sync();
   B.settings.ignore = [];
-  await expect(B.engine.sync()).rejects.toThrow("conflict: Task 9");
+  const [copy] = (await B.engine.sync()).conflicts;
+  expect(copy).toMatch(/^private\/x \(conflict B \d{4}-\d\d-\d\d \d{4}\)\.md$/);
   const C = makeDevice(fake, keys, "C");
   await C.engine.sync();
   expect(await text(C.fs, "private/x.md")).toBe("A");
+  expect(await text(C.fs, copy)).toBe("B");
 });
 
 test("restart does not re-download skipped remote files", async () => {
@@ -302,4 +290,257 @@ test("restart does not re-download skipped remote files", async () => {
   await B2.sync();
   expect(B.api.reads).toBe(reads + 3); // getHead, getTree, m.md
   expect(B.fs.paths()).toEqual(["m.md"]);
+});
+
+// ---- Task 9: merge, conflict copies, deletions, safety guards ----
+
+const T = new Date(2026, 9, 27, 14, 5).getTime();
+const at = { now: () => T };
+
+async function pair(content: Record<string, string | ArrayBuffer>, opts: Parameters<typeof makeDevice>[3] = {}) {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A", { ...at, ...opts }), B = makeDevice(fake, keys, "B", { ...at, ...opts });
+  for (const [p, c] of Object.entries(content)) A.fs.set(p, c);
+  await A.engine.sync();
+  await B.engine.sync();
+  return { fake, keys, A, B };
+}
+
+test("non-overlapping concurrent edits merge silently", async () => {
+  const { A, B } = await pair({ "n.md": "a\nb\nc" });
+  A.fs.set("n.md", "A\nb\nc");
+  B.fs.set("n.md", "a\nb\nC");
+  await A.engine.sync();
+  const r = await B.engine.sync();
+  expect(r.conflicts).toEqual([]);
+  await A.engine.sync();
+  for (const d of [A, B]) {
+    expect(d.fs.paths()).toEqual(["n.md"]);
+    expect(await text(d.fs, "n.md")).toBe("A\nb\nC");
+  }
+});
+
+test("overlapping edits → conflict copy, remote keeps path", async () => {
+  const { A, B } = await pair({ "note.md": "x" });
+  A.fs.set("note.md", "y");
+  await A.engine.sync();
+  B.fs.set("note.md", "z");
+  const r = await B.engine.sync();
+  const copy = "note (conflict B 2026-10-27 1405).md";
+  expect(r.conflicts).toEqual([copy]);
+  expect(r.pushed).toContain(copy);
+  await A.engine.sync();
+  for (const d of [A, B]) {
+    expect(d.fs.paths()).toEqual([copy, "note.md"]);
+    expect(await text(d.fs, "note.md")).toBe("y");
+    expect(await text(d.fs, copy)).toBe("z");
+  }
+});
+
+test("conflict copy never overwrites an existing file", async () => {
+  const { A, B } = await pair({ "note.md": "x" });
+  B.fs.set("note (conflict B 2026-10-27 1405).md", "older copy");
+  await B.engine.sync();
+  A.fs.set("note.md", "y");
+  await A.engine.sync();
+  B.fs.set("note.md", "z");
+  expect((await B.engine.sync()).conflicts).toEqual(["note (conflict B 2026-10-27 1405) 2.md"]);
+  expect(await text(B.fs, "note (conflict B 2026-10-27 1405).md")).toBe("older copy");
+});
+
+test("binary edited on both → conflict copy", async () => {
+  const bin = (...b: number[]) => new Uint8Array(b).buffer as ArrayBuffer;
+  const { A, B } = await pair({ "img.png": bin(1, 2, 3) });
+  A.fs.set("img.png", bin(1, 2, 4));
+  await A.engine.sync();
+  B.fs.set("img.png", bin(9, 9));
+  expect((await B.engine.sync()).conflicts).toEqual(["img (conflict B 2026-10-27 1405).png"]);
+  expect(new Uint8Array(await B.fs.read("img.png"))).toEqual(new Uint8Array([1, 2, 4]));
+  expect(new Uint8Array(await B.fs.read("img (conflict B 2026-10-27 1405).png"))).toEqual(new Uint8Array([9, 9]));
+});
+
+test("merge without a fetchable base → conflict copy", async () => {
+  const { fake, A, B } = await pair({ "n.md": "a\nb\nc" });
+  A.fs.set("n.md", "A\nb\nc");
+  await A.engine.sync();
+  B.fs.set("n.md", "a\nb\nC");
+  const baseSha = B.store.saved!.files["n.md"].blobSha;
+  const orig = fake.getBlobText.bind(fake);
+  B.api.getBlobText = async (sha: string) => { if (sha === baseSha) throw new Error("gone"); return orig(sha); };
+  expect((await B.engine.sync()).conflicts).toEqual(["n (conflict B 2026-10-27 1405).md"]);
+  expect(await text(B.fs, "n.md")).toBe("A\nb\nc");
+});
+
+test("created on both without base, identical → no conflict", async () => {
+  const { fake, A, B } = await pair({});
+  A.fs.set("n.md", "same");
+  B.fs.set("n.md", "same");
+  await A.engine.sync();
+  const writes = fake.totalWrites;
+  expect(await B.engine.sync()).toMatchObject({ conflicts: [], pushed: [] });
+  expect(fake.totalWrites).toBe(writes);
+});
+
+test("created on both without base, different → conflict copy", async () => {
+  const { A, B } = await pair({});
+  A.fs.set("n.md", "from A");
+  B.fs.set("n.md", "from B");
+  await A.engine.sync();
+  expect((await B.engine.sync()).conflicts).toEqual(["n (conflict B 2026-10-27 1405).md"]);
+  await A.engine.sync();
+  for (const d of [A, B]) {
+    expect(await text(d.fs, "n.md")).toBe("from A");
+    expect(await text(d.fs, "n (conflict B 2026-10-27 1405).md")).toBe("from B");
+  }
+});
+
+test("delete vs edit → edit wins, file restored everywhere", async () => {
+  // local delete, remote edit
+  const { A, B } = await pair({ "n.md": "v1", "m.md": "m1" });
+  A.fs.set("n.md", "v2");
+  await A.engine.sync();
+  B.fs.remove("n.md");
+  await B.engine.sync();
+  expect(await text(B.fs, "n.md")).toBe("v2");
+  // local edit, remote delete
+  A.fs.remove("m.md");
+  await A.engine.sync();
+  B.fs.set("m.md", "m2");
+  await B.engine.sync();
+  await A.engine.sync();
+  for (const d of [A, B]) {
+    expect(d.fs.paths()).toEqual(["m.md", "n.md"]);
+    expect(await text(d.fs, "m.md")).toBe("m2");
+  }
+});
+
+test("typing during pull write → deferred, local edit preserved", async () => {
+  const { A, B } = await pair({ "x.md": "one\ntwo", "y.md": "one\ntwo" });
+  A.fs.set("x.md", "ONE\ntwo");
+  A.fs.set("y.md", "ONE\ntwo");
+  await A.engine.sync();
+  let typed = "";
+  B.fs.onBeforeWrite = (p) => {
+    B.fs.onBeforeWrite = undefined;
+    typed = p === "x.md" ? "y.md" : "x.md";
+    B.fs.set(typed, "one\ntwo typed");
+  };
+  const r = await B.engine.sync();
+  expect(r.deferred).toEqual([typed]);
+  expect(await text(B.fs, typed)).toBe("one\ntwo typed");
+  expect((await B.engine.sync()).conflicts).toEqual([]);
+  expect(await text(B.fs, typed)).toBe("ONE\ntwo typed");
+  await A.engine.sync();
+  expect(await text(A.fs, typed)).toBe("ONE\ntwo typed");
+});
+
+test("remote deletion of a file being edited is deferred, not trashed", async () => {
+  const { A, B } = await pair({ "x.md": "x", "y.md": "y" });
+  A.fs.remove("x.md");
+  A.fs.set("y.md", "y2");
+  await A.engine.sync();
+  B.fs.onBeforeWrite = () => { B.fs.onBeforeWrite = undefined; B.fs.set("x.md", "typed"); };
+  expect((await B.engine.sync()).deferred).toEqual(["x.md"]);
+  await B.engine.sync();
+  await A.engine.sync();
+  expect(await text(A.fs, "x.md")).toBe("typed");
+});
+
+test("mass delete asks and can be refused", async () => {
+  const files: Record<string, string> = {};
+  for (let i = 0; i < 30; i++) files[`n${i}.md`] = `c${i}`;
+  const asked: [number, number][] = [];
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A", { confirmMassDelete: async (n, t) => (asked.push([n, t]), true) });
+  const B = makeDevice(fake, keys, "B", { confirmMassDelete: async (n, t) => (asked.push([n, t]), false) });
+  for (const [p, c] of Object.entries(files)) A.fs.set(p, c);
+  await A.engine.sync();
+  await B.engine.sync();
+  for (let i = 0; i < 11; i++) A.fs.remove(`n${i}.md`);
+  A.fs.set("n29.md", "edited");
+  await A.engine.sync();
+  expect(asked).toEqual([[11, 30]]);
+  const before = structuredClone(B.store.saved!.files);
+  const r = await B.engine.sync();
+  expect(asked).toEqual([[11, 30], [11, 30]]);
+  expect(r.deleted).toEqual([]);
+  expect(r.pulled).toEqual(["n29.md"]); // everything else syncs
+  expect(B.fs.paths()).toHaveLength(30);
+  for (let i = 0; i < 11; i++) expect(B.store.saved!.files[`n${i}.md`]).toEqual(before[`n${i}.md`]);
+  await B.engine.sync(); // asks again
+  expect(asked).toHaveLength(3);
+  expect(B.fs.paths()).toHaveLength(30);
+});
+
+test("refused local mass delete keeps files on GitHub", async () => {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A", { confirmMassDelete: async () => false });
+  for (let i = 0; i < 20; i++) A.fs.set(`n${i}.md`, `c${i}`);
+  await A.engine.sync();
+  for (let i = 0; i < 15; i++) A.fs.remove(`n${i}.md`);
+  expect((await A.engine.sync()).deleted).toEqual([]);
+  expect(fTree(fake)).toHaveLength(20);
+});
+
+test("folder rename of 50 files is not mass delete", async () => {
+  const confirm = async () => { throw new Error("must not ask"); };
+  const files: Record<string, string> = {};
+  for (let i = 0; i < 50; i++) files[`old/n${i}.md`] = `c${i}`;
+  const { A, B } = await pair(files, { confirmMassDelete: confirm });
+  for (let i = 0; i < 50; i++) {
+    A.fs.remove(`old/n${i}.md`);
+    A.fs.set(`new/n${i}.md`, `c${i}`);
+  }
+  await A.engine.sync();
+  await B.engine.sync();
+  expect(B.fs.paths()).toEqual(Array.from({ length: 50 }, (_, i) => `new/n${i}.md`).sort());
+});
+
+test("empty local vault vs full remote downloads, never deletes", async () => {
+  const files: Record<string, string> = {};
+  for (let i = 0; i < 30; i++) files[`n${i}.md`] = `c${i}`;
+  const confirm = async () => { throw new Error("must not ask"); };
+  const { fake, B } = await pair(files, { confirmMassDelete: confirm });
+  for (const p of B.fs.paths()) B.fs.remove(p);
+  const r = await B.engine.sync();
+  expect(r.deleted).toEqual([]);
+  expect(B.fs.paths()).toHaveLength(30);
+  expect(fTree(fake)).toHaveLength(30);
+});
+
+test("repo emptied (head → null) never trashes local files", async () => {
+  const files: Record<string, string> = {};
+  for (let i = 0; i < 30; i++) files[`n${i}.md`] = `c${i}`;
+  const confirm = async () => { throw new Error("must not ask"); };
+  const now = () => T;
+  const { fake, A } = await pair(files, { confirmMassDelete: confirm, bucket: new TokenBucket(100, 4, now) });
+  fake.commits.length = 0;
+  const r = await A.engine.sync();
+  expect(r.deleted).toEqual([]);
+  expect(A.fs.paths()).toHaveLength(30);
+  expect(fTree(fake)).toHaveLength(30); // treated as first upload
+});
+
+test("remote path differing only by case → conflict copy", async () => {
+  const { A, B } = await pair({});
+  B.fs.set("Note.md", "mine");
+  A.fs.set("note.md", "theirs");
+  await A.engine.sync();
+  const r = await B.engine.sync();
+  expect(r.conflicts).toEqual(["note (conflict B 2026-10-27 1405).md"]);
+  expect(B.fs.paths()).toEqual(["Note.md", "note (conflict B 2026-10-27 1405).md"]);
+  expect(await text(B.fs, "note (conflict B 2026-10-27 1405).md")).toBe("theirs");
+  const again = await B.engine.sync();
+  expect(again).toMatchObject({ conflicts: [], deleted: [], pulled: [] });
+});
+
+test(".obsidian json merged key-wise when syncConfig", async () => {
+  const cfg = { settings: { syncConfig: true } };
+  const { A, B } = await pair({ ".obsidian/app.json": '{\n  "a": 1,\n  "b": 1,\n  "c": 1\n}' }, cfg);
+  A.fs.set(".obsidian/app.json", '{\n  "a": 2,\n  "b": 1,\n  "c": 3\n}');
+  await A.engine.sync();
+  B.fs.set(".obsidian/app.json", '{\n  "a": 1,\n  "b": 5,\n  "c": 4\n}');
+  expect((await B.engine.sync()).conflicts).toEqual([]);
+  await A.engine.sync();
+  for (const d of [A, B]) expect(JSON.parse(await text(d.fs, ".obsidian/app.json"))).toEqual({ a: 2, b: 5, c: 3 });
 });
