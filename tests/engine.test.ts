@@ -1,5 +1,6 @@
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { TokenBucket } from "../src/bucket";
+import { AuthError, RateLimitError, ShaConflictError } from "../src/http";
 import { createVault } from "../src/crypto";
 import { FakeGitHub } from "./fake-github";
 import { makeDevice, setupRepo, text } from "./helpers";
@@ -607,4 +608,152 @@ test("one creation offsets only one deletion of identical files", async () => {
   await A.engine.sync();
   expect(asked).toEqual([14]);
   expect(fTree(fake)).toHaveLength(21);
+});
+
+// ---- Task 10: tarball, rebind, API errors ----
+
+test("fresh device with >300 remote changes uses tarball", async () => {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A"), B = makeDevice(fake, keys, "B");
+  for (let i = 0; i < 301; i++) A.fs.set(`n${i}.md`, `c${i}`);
+  await A.engine.sync();
+  const blobs = vi.spyOn(B.api, "getBlobText"), tars = vi.spyOn(B.api, "getTarball");
+  expect((await B.engine.sync()).pulled).toHaveLength(301);
+  expect(tars).toHaveBeenCalledTimes(1);
+  expect(blobs).not.toHaveBeenCalled();
+  expect(B.api.reads).toBe(3); // getHead, getTree, getTarball
+  expect(await text(B.fs, "n300.md")).toBe("c300");
+  // known device, >300 remote edits: tarball again
+  for (let i = 0; i < 301; i++) A.fs.set(`n${i}.md`, `d${i}`);
+  await A.engine.sync();
+  expect((await B.engine.sync()).pulled).toHaveLength(301);
+  expect(tars).toHaveBeenCalledTimes(2);
+  expect(blobs).not.toHaveBeenCalled();
+  expect(await text(B.fs, "n0.md")).toBe("d0");
+});
+
+test("fresh device tarball still records skipped remote files", async () => {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A", { settings: { syncConfig: true } }), B = makeDevice(fake, keys, "B");
+  A.fs.set(".obsidian/app.json", "{}");
+  A.fs.set("n.md", "n");
+  await A.engine.sync();
+  const blobs = vi.spyOn(B.api, "getBlobText");
+  await B.engine.sync();
+  expect(blobs).not.toHaveBeenCalled();
+  expect(B.fs.paths()).toEqual(["n.md"]);
+  expect(Object.values(B.store.saved!.skipped!).map((e) => e.path)).toEqual([".obsidian/app.json"]);
+});
+
+async function rebindSetup() {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A", at), B = makeDevice(fake, keys, "B", at);
+  A.fs.set("n.md", "v1");
+  A.fs.set("same.md", "s");
+  await A.engine.sync();
+  await B.engine.sync();
+  return { fake, A, B };
+}
+
+test("rebind: lost state, identical files → no transfers, no conflicts", async () => {
+  const { fake, B } = await rebindSetup();
+  B.store.saved = null;
+  const writes = fake.totalWrites;
+  expect(await B.engine.sync()).toMatchObject({ pulled: [], pushed: [], conflicts: [] });
+  expect(fake.totalWrites).toBe(writes);
+  expect(Object.keys(B.store.saved!.files).sort()).toEqual(["n.md", "same.md"]);
+});
+
+test("rebind: local file is an older version → takes remote, no conflict", async () => {
+  const { fake, A, B } = await rebindSetup();
+  A.fs.set("n.md", "v2");
+  await A.engine.sync();
+  A.fs.set("n.md", "v3");
+  await A.engine.sync();
+  B.store.saved = null;
+  const writes = fake.totalWrites;
+  expect(await B.engine.sync()).toMatchObject({ pulled: ["n.md"], pushed: [], conflicts: [] });
+  expect(await text(B.fs, "n.md")).toBe("v3");
+  expect(B.fs.paths()).toEqual(["n.md", "same.md"]);
+  expect(fake.totalWrites).toBe(writes);
+});
+
+test("rebind: local file diverged → conflict copy", async () => {
+  const { fake, A, B } = await rebindSetup();
+  A.fs.set("n.md", "v2");
+  await A.engine.sync();
+  B.store.saved = null;
+  B.fs.set("n.md", "mine");
+  const r = await B.engine.sync();
+  expect(r.conflicts).toEqual(["n (conflict B 2026-10-27 1405).md"]);
+  expect(await text(B.fs, "n.md")).toBe("v2");
+  expect(await text(B.fs, "n (conflict B 2026-10-27 1405).md")).toBe("mine");
+  expect(fTree(fake)).toHaveLength(3);
+});
+
+test("persistent sha conflict gives up after 3 retries without data loss", async () => {
+  const { A, B } = await pair({ "n.md": "a\nb\nc" });
+  B.fs.set("n.md", "a\nb\nC");
+  for (let i = 0; i < 4; i++) B.api.failNext("putFile", new ShaConflictError("x"));
+  const put = vi.spyOn(B.api, "putFile");
+  const r = await B.engine.sync();
+  expect(put).toHaveBeenCalledTimes(4);
+  expect(r.pushed).toEqual([]);
+  expect(await text(B.fs, "n.md")).toBe("a\nb\nC");
+  expect((await B.engine.sync()).pushed).toEqual(["n.md"]);
+  await A.engine.sync();
+  expect(await text(A.fs, "n.md")).toBe("a\nb\nC");
+});
+
+test("sha conflict on push re-pulls, merges and retries in the same cycle", async () => {
+  const { A, B } = await pair({ "n.md": "a\nb\nc" });
+  B.fs.set("n.md", "a\nb\nC");
+  B.api.onBeforeWrite = async () => { // A commits right before B's PUT lands
+    B.api.onBeforeWrite = undefined;
+    A.fs.set("n.md", "A\nb\nc");
+    await A.engine.sync();
+  };
+  const r = await B.engine.sync();
+  expect(r.conflicts).toEqual([]);
+  expect(r.pushed).toEqual(["n.md"]);
+  await A.engine.sync();
+  for (const d of [A, B]) expect(await text(d.fs, "n.md")).toBe("A\nb\nC");
+});
+
+test("RateLimitError mid-cycle saves progress and reports resetAt", async () => {
+  const { A, B } = await pair({ "n1.md": "1", "n2.md": "2" });
+  A.fs.set("n1.md", "1b");
+  A.fs.set("n2.md", "2b");
+  await A.engine.sync();
+  const orig = B.api.getBlobText.bind(B.api);
+  let calls = 0;
+  B.api.getBlobText = async (sha) => {
+    if (++calls === 2) throw new RateLimitError(T + 60_000);
+    return orig(sha);
+  };
+  const r = await B.engine.sync();
+  expect(r.rateLimitedUntil).toBe(T + 60_000);
+  expect(r.pulled).toEqual(["n1.md"]);
+  expect(await text(B.fs, "n1.md")).toBe("1b");
+  expect(await text(B.fs, "n2.md")).toBe("2");
+  const reads = B.api.reads;
+  expect((await B.engine.sync()).pulled).toEqual(["n2.md"]);
+  expect(B.api.reads).toBe(reads + 3); // getHead, getTree, n2 only: n1 progress was saved
+  expect(await text(B.fs, "n2.md")).toBe("2b");
+});
+
+test("AuthError mid-cycle leaves files and state intact and rethrows", async () => {
+  const { fake, A, B } = await pair({ "n.md": "v1" });
+  B.fs.set("n.md", "v2");
+  B.fs.set("new.md", "x");
+  const saved = structuredClone(B.store.saved);
+  B.api.failNext("putFile", new AuthError());
+  await expect(B.engine.sync()).rejects.toBeInstanceOf(AuthError);
+  expect(await text(B.fs, "n.md")).toBe("v2");
+  expect(B.fs.paths()).toEqual(["n.md", "new.md"]);
+  expect(B.store.saved!.files).toEqual(saved!.files);
+  expect((await B.engine.sync()).pushed.sort()).toEqual(["n.md", "new.md"]);
+  await A.engine.sync();
+  expect(await text(A.fs, "n.md")).toBe("v2");
+  expect(fTree(fake)).toHaveLength(2);
 });

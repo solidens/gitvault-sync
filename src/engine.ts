@@ -1,6 +1,7 @@
 import type { TokenBucket } from "./bucket";
 import { decryptFile, encryptFile, pathToken, type VaultKeys } from "./crypto";
 import type { GitHubApi } from "./github";
+import { AuthError, RateLimitError, ShaConflictError } from "./http";
 import type { LocalFs } from "./localfs";
 import { isMergeablePath, MAX_MERGE_BYTES, merge3, mergeJson, tryDecodeUtf8 } from "./merge";
 import { emptyState, type StateStore, type SyncState } from "./state";
@@ -36,13 +37,40 @@ interface Remote { token: string; sha: string; data?: ArrayBuffer }
 /** local null = delete on GitHub; prev = blob sha currently on GitHub (null = new file). */
 interface Push { path: string; token: string; prev: string | null; local: Local | null }
 
+/** Push rejected because GitHub moved (409/422): re-run the cycle (pull, merge, push) at most this often. */
+const MAX_SHA_RETRIES = 3;
+
 export class SyncEngine {
+  private tarball = new Map<string, string>(); // blob sha -> ciphertext from this cycle's tarball
   constructor(private d: EngineDeps) {}
 
+  /** AuthError is rethrown (caller pauses); rate limits and persistent sha conflicts end the cycle with a report. */
   async sync(): Promise<SyncReport> {
-    const { api, fs, keys, store, settings } = this.d;
-    const state = (await store.load()) ?? emptyState();
     const report: SyncReport = { pulled: [], pushed: [], deleted: [], conflicts: [], deferred: [], skippedLarge: [] };
+    try {
+      for (let retry = 0; ; retry++) {
+        const state = (await this.d.store.load()) ?? emptyState();
+        try {
+          await this.cycle(state, report, retry > 0);
+          return report;
+        } catch (e) {
+          if (!(e instanceof ShaConflictError || e instanceof RateLimitError || e instanceof AuthError)) throw e;
+          await this.d.store.save(state); // every state change so far matches the disk
+          if (e instanceof AuthError) throw e;
+          if (e instanceof RateLimitError) return { ...report, rateLimitedUntil: e.resetAt };
+          if (retry === MAX_SHA_RETRIES) return report; // local content is on disk; next cycle tries again
+        }
+      }
+    } finally {
+      this.tarball.clear();
+    }
+  }
+
+  /** One pass. repoll = skip the ETag so a retry after a sha conflict sees the new head. */
+  private async cycle(state: SyncState, report: SyncReport, repoll: boolean): Promise<void> {
+    const { api, fs, keys, store, settings } = this.d;
+    report.deferred = []; report.skippedLarge = []; // describe the latest pass; the other lists accumulate across retries
+    const fresh = state.headSha === null && Object.keys(state.files).length === 0;
     const ignore = [...ALWAYS_IGNORED, ...settings.ignore];
     const tooLarge = new Set<string>();
     const skip = (p: string) =>
@@ -56,7 +84,7 @@ export class SyncEngine {
     }
 
     // 1. Poll. headSha/refEtag only decide whether to fetch the tree; changes are detected per file.
-    const head = await api.getHead(state.refEtag);
+    const head = await api.getHead(repoll ? null : state.refEtag);
     let base = state.headSha; // commit the batch path builds on; null = empty repo (putFile only)
     let tree: Map<string, string> | null = null;
     if (!head.notModified) {
@@ -97,6 +125,7 @@ export class SyncEngine {
       else remote.set(f.path, { token, sha, data: f.data });
     };
     const byToken = new Map(Object.entries(state.files).map(([p, r]) => [r.token, p]));
+    if (tree && base) await this.prefetch(base, tree, state, fresh);
     if (tree) {
       for (const [rp, sha] of tree) {
         if (!rp.startsWith("f/")) continue; // gitvault.json etc.
@@ -179,7 +208,7 @@ export class SyncEngine {
         report.pulled.push(p);
         continue;
       }
-      if (!localChanged) { // remote changed, local unchanged
+      if (!localChanged || (!rec && await this.isOldVersion(rem.token, loc.hash))) { // remote changed, local unchanged or an old remote version
         if (await this.changedSinceScan(loc.diskPath, loc)) { report.deferred.push(p); continue; }
         synced(await fs.write(loc.diskPath, data));
         report.pulled.push(p);
@@ -238,7 +267,36 @@ export class SyncEngine {
 
     // 4. Push.
     if (pushes.length) await this.push(state, pushes, base, report);
-    return report;
+  }
+
+  /** One tarball instead of per-file blobs: first load of a device, or more than tarballThreshold blobs to fetch. */
+  private async prefetch(headSha: string, tree: Map<string, string>, state: SyncState, fresh: boolean): Promise<void> {
+    const known = new Map(Object.values(state.files).map((r) => [r.token, r.blobSha]));
+    let n = 0;
+    for (const [rp, sha] of tree) {
+      const token = rp.slice(rp.lastIndexOf("/") + 1);
+      if (rp.startsWith("f/") && known.get(token) !== sha && state.skipped?.[token]?.blobSha !== sha) n++;
+    }
+    if (!(n > this.d.settings.tarballThreshold || (fresh && n > 0))) return;
+    let files: Map<string, string>;
+    try {
+      files = await this.d.api.getTarball(headSha);
+    } catch (e) {
+      if (e instanceof RateLimitError || e instanceof AuthError) throw e;
+      return; // e.g. no DecompressionStream: fall back to per-file blobs
+    }
+    for (const [rp, sha] of tree) {
+      const t = files.get(rp);
+      if (t !== undefined) this.tarball.set(sha, t);
+    }
+  }
+
+  /** Rebind without state: does the local file equal one of the last 20 remote versions (an outdated copy)? */
+  private async isOldVersion(token: string, localHash: string): Promise<boolean> {
+    for (const sha of await this.d.api.fileHistoryBlobShas(repoPath(token), 20)) {
+      if ((await sha256Hex((await this.download(sha)).data)) === localHash) return true;
+    }
+    return false;
   }
 
   /** Disk differs from the scan (user typing, file created/removed meanwhile)? loc undefined = absent at scan. */
@@ -273,7 +331,7 @@ export class SyncEngine {
   }
 
   private async download(blobSha: string): Promise<{ path: string; data: ArrayBuffer }> {
-    const f = await decryptFile(this.d.keys, await this.d.api.getBlobText(blobSha));
+    const f = await decryptFile(this.d.keys, this.tarball.get(blobSha) ?? await this.d.api.getBlobText(blobSha));
     return { path: nfc(f.path), data: f.data };
   }
 
