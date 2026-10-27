@@ -235,7 +235,9 @@ export class SyncEngine {
         report.pulled.push(p);
         continue;
       }
-      if (!localChanged || (!rec && await this.isOldVersion(rem.token, loc.hash))) { // remote changed, local unchanged or an old remote version
+      // remote changed and local unchanged, or (rebind without state only) local is an old remote version;
+      // with state, a new local file matching an old version is a deliberate re-creation (e.g. renamed back), never stale
+      if (!localChanged || (!rec && fresh && await this.isOldVersion(rem.token, loc.hash))) {
         const cur = await this.scanned(loc);
         const st = cur && await put(loc.diskPath, data, cur);
         if (!st) { report.deferred.push(p); continue; }
