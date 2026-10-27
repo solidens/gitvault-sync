@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, test, vi } from "vitest";
 import { RestGitHub } from "../src/github";
 import { AuthError, RateLimitError, ShaConflictError, type Http, type HttpRequest, type HttpResponse } from "../src/http";
@@ -178,9 +179,6 @@ describe("RestGitHub", () => {
   test("repoSizeKb", async () => {
     expect(await rig({ [`GET ${B}`]: { json: { size: 42 } } }).gh.repoSizeKb()).toBe(42);
   });
-  test("getTarball not implemented yet", async () => {
-    await expect(rig({}).gh.getTarball("c")).rejects.toThrow("not implemented");
-  });
   test("error mapping", async () => {
     const k = `GET ${B}`;
     await expect(rig({ [k]: { status: 401 } }).gh.repoSizeKb()).rejects.toBeInstanceOf(AuthError);
@@ -194,5 +192,16 @@ describe("RestGitHub", () => {
     expect(e3.resetAt).toBe(65000);
     vi.restoreAllMocks();
     await expect(rig({ [k]: { status: 500 } }).gh.repoSizeKb()).rejects.toMatchObject({ name: "HttpError", status: 500 });
+  });
+});
+
+describe("RestGitHub.getTarball", () => {
+  test("downloads, strips first path segment, decodes UTF-8", async () => {
+    const b = readFileSync(new URL("./fixtures/sample.tar.gz", import.meta.url));
+    const { gh, calls } = rig({ "GET https://api.github.com/repos/o/r/tarball/abc": { arrayBuffer: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer } });
+    const m = await gh.getTarball("abc");
+    expect([...m.keys()].sort()).toEqual(["f/ab/abcd", "f/cd/" + "x".repeat(120)]);
+    expect(m.get("f/ab/abcd")).toBe("hello");
+    expect(calls[0].headers?.Authorization).toBe("Bearer tok");
   });
 });

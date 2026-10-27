@@ -1,4 +1,5 @@
 import { AuthError, type Http, type HttpResponse, HttpError, RateLimitError, ShaConflictError } from "./http";
+import { gunzip, parseTar } from "./tar";
 import { b64encode } from "./util";
 
 export type Head = { notModified: true } | { notModified: false; sha: string | null; etag: string }; // sha null = empty repo
@@ -93,8 +94,12 @@ export class RestGitHub implements GitHubApi {
     return { commitSha: c.sha as string };
   }
 
-  async getTarball(_commitSha: string): Promise<Map<string, string>> {
-    throw new Error("not implemented");
+  async getTarball(commitSha: string): Promise<Map<string, string>> {
+    const r = await this.req("GET", `/tarball/${commitSha}`);
+    const dec = new TextDecoder();
+    const out = new Map<string, string>();
+    for (const [name, bytes] of parseTar(await gunzip(r.arrayBuffer))) out.set(name.slice(name.indexOf("/") + 1), dec.decode(bytes));
+    return out;
   }
 
   async fileHistoryBlobShas(path: string, limit: number): Promise<string[]> {
