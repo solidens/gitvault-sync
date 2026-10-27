@@ -37,6 +37,7 @@ export class FakeGitHub implements GitHubApi {
     q.push(err);
     this.s.failures.set(method, q);
   }
+  clearFailures(): void { this.s.failures.clear(); }
 
   private enter(method: keyof GitHubApi): void {
     const err = this.s.failures.get(method)?.shift();

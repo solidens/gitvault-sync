@@ -73,6 +73,7 @@ export class MemoryStateStore implements StateStore {
   failNextSave(err: Error): void {
     this.fail = err;
   }
+  clearFail(): void { this.fail = null; }
   async load(): Promise<SyncState | null> {
     return this.saved ? structuredClone(this.saved) : null;
   }
