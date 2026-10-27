@@ -26,7 +26,7 @@ export function b64decode(s: string): Uint8Array {
 }
 
 export async function sha256Hex(data: ArrayBuffer | Uint8Array): Promise<string> {
-  return hex(await crypto.subtle.digest("SHA-256", bytes(data)));
+  return hex(await crypto.subtle.digest("SHA-256", bytes(data) as BufferSource));
 }
 
 export async function gitBlobSha(text: string): Promise<string> {
