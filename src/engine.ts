@@ -53,6 +53,8 @@ export class SyncEngine {
   private tarball = new Map<string, string>(); // blob sha -> ciphertext from this cycle's tarball
   private unpushed = new Set<string>(); // paths of the current push not sent yet
   private refused = new Map<string, { disk: string; n: number }>(); // path -> CAS refusals in a row while the disk stayed the same
+  private counted = new Set<string>(); // refusals counted in this sync() (sha-conflict re-runs count once)
+  private plain = new Set<string>(); // paths that fell back to plain writes in this sync(): later writes skip the CAS
   constructor(private d: EngineDeps) {}
 
   /** AuthError is rethrown (caller pauses); rate limits and persistent sha conflicts end the cycle with a report. */
@@ -75,6 +77,8 @@ export class SyncEngine {
     } finally {
       this.tarball.clear();
       this.unpushed.clear();
+      this.counted.clear();
+      this.plain.clear();
     }
   }
 
@@ -175,7 +179,17 @@ export class SyncEngine {
     let again = false; // something waits for the next cycle: keep the old head
     const taken = (q: string) => local.has(q) || remote.has(q) || !!state.files[q];
     // compare-and-swap write; null = the user changed the file meanwhile (deferred to the next cycle)
+    // backstop: the editor-level check keeps refusing although the file on disk never changed (a text
+    // normalization we don't know about): byte check, plain write; the count follows the file to its new stat
+    const plainWrite = async (q: string, data: ArrayBuffer, expected: ArrayBuffer, n: number) => {
+      if ((await sha256Hex(await fs.read(q))) !== (await sha256Hex(expected))) return null;
+      const st = await fs.write(q, data);
+      this.plain.add(q);
+      this.refused.set(q, { disk: `${st.mtime}:${st.size}`, n });
+      return st;
+    };
     const put = async (q: string, data: ArrayBuffer, expected: ArrayBuffer | null) => {
+      if (expected && this.plain.has(q)) return plainWrite(q, data, expected, this.refused.get(q)?.n ?? MAX_REFUSALS);
       try {
         const st = await fs.write(q, data, expected);
         this.refused.delete(q);
@@ -185,13 +199,10 @@ export class SyncEngine {
         const st = expected && await fs.stat(q);
         if (!st) return null;
         const disk = `${st.mtime}:${st.size}`, r = this.refused.get(q);
-        const n = r?.disk === disk ? r.n + 1 : 1;
+        const n = r?.disk !== disk ? 1 : this.counted.has(q) ? r.n : r.n + 1;
+        this.counted.add(q);
         this.refused.set(q, { disk, n });
-        // backstop: the editor-level check keeps refusing although the file on disk never changed (a text
-        // normalization we don't know about): fall back to a byte check and a plain write
-        if (n < MAX_REFUSALS || (await sha256Hex(await fs.read(q))) !== (await sha256Hex(expected))) return null;
-        this.refused.delete(q);
-        return fs.write(q, data);
+        return n < MAX_REFUSALS ? null : plainWrite(q, data, expected, n);
       }
     };
     const newPush = async (q: string, st: { mtime: number; size: number }, hash: string): Promise<Push> =>

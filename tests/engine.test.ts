@@ -932,3 +932,37 @@ test("overlapping edit with the target being typed into → deferred without a c
   expect((await B.engine.sync()).conflicts).toEqual(["n (conflict B 2026-10-27 1405).md"]);
   expect(await text(B.fs, "n (conflict B 2026-10-27 1405).md")).toBe("mine typed");
 });
+
+test("persistently refusing CAS on the conflict path converges: one copy at most, remote pulled", async () => {
+  let t = T;
+  const { A, B } = await pair({ "n.md": "a" }, { now: () => (t += 60_000) });
+  A.fs.set("n.md", "theirs");
+  await A.engine.sync();
+  B.fs.set("n.md", "mine");
+  const write = B.fs.write.bind(B.fs);
+  B.fs.write = async (p, data, expected) => {
+    if (expected) throw new LocalChangedError(p);
+    return write(p, data, expected);
+  };
+  for (let i = 0; i < 10; i++) await B.engine.sync();
+  expect(B.fs.paths().filter((p) => p.includes("(conflict")).length).toBeLessThanOrEqual(1);
+  expect(await text(B.fs, "n.md")).toBe("theirs");
+  expect((await B.engine.sync()).deferred).toEqual([]);
+});
+
+test("sha-conflict re-runs count a CAS refusal once per sync", async () => {
+  const { A, B } = await pair({ "x.md": "one", "z.md": "z" });
+  A.fs.set("x.md", "two");
+  await A.engine.sync();
+  B.fs.set("z.md", "z2");
+  for (let i = 0; i < 4; i++) B.api.failNext("putFile", new ShaConflictError("z")); // 4 cycles in one sync()
+  const write = B.fs.write.bind(B.fs);
+  B.fs.write = async (p, data, expected) => {
+    if (expected) throw new LocalChangedError(p);
+    return write(p, data, expected);
+  };
+  expect((await B.engine.sync()).deferred).toEqual(["x.md"]);
+  expect((await B.engine.sync()).deferred).toEqual(["x.md"]); // second refusal, still below the backstop
+  expect((await B.engine.sync()).deferred).toEqual([]);
+  expect(await text(B.fs, "x.md")).toBe("two");
+});
