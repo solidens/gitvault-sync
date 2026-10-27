@@ -154,15 +154,17 @@ describe("RestGitHub", () => {
   });
   test("commitBatch sequence; 422 on ref -> ShaConflictError", async () => {
     const replies = {
+      [`GET ${B}/git/commits/c1`]: { json: { tree: { sha: "t1" } } },
       [`POST ${B}/git/trees`]: { json: { sha: "t" } },
       [`POST ${B}/git/commits`]: { json: { sha: "c2" } },
       [`PATCH ${B}/git/refs/heads/main`]: { json: {} },
     };
     const { gh, calls } = rig(replies);
     expect(await gh.commitBatch("c1", [{ path: "a", text: "x" }, { path: "b", text: null }], "m")).toEqual({ commitSha: "c2" });
-    expect(JSON.parse(calls[0]!.body as string)).toEqual({ base_tree: "c1", tree: [{ path: "a", mode: "100644", type: "blob", content: "x" }, { path: "b", mode: "100644", type: "blob", sha: null }] });
-    expect(JSON.parse(calls[1]!.body as string)).toEqual({ message: "m", tree: "t", parents: ["c1"] });
-    expect(JSON.parse(calls[2]!.body as string)).toEqual({ sha: "c2", force: false });
+    expect(calls.map((c) => c.method)).toEqual(["GET", "POST", "POST", "PATCH"]);
+    expect(JSON.parse(calls[1]!.body as string)).toEqual({ base_tree: "t1", tree: [{ path: "a", mode: "100644", type: "blob", content: "x" }, { path: "b", mode: "100644", type: "blob", sha: null }] });
+    expect(JSON.parse(calls[2]!.body as string)).toEqual({ message: "m", tree: "t", parents: ["c1"] });
+    expect(JSON.parse(calls[3]!.body as string)).toEqual({ sha: "c2", force: false });
     await expect(rig({ ...replies, [`PATCH ${B}/git/refs/heads/main`]: { status: 422 } }).gh.commitBatch("c1", [], "m")).rejects.toBeInstanceOf(ShaConflictError);
   });
   test("fileHistoryBlobShas skips 404", async () => {
@@ -188,6 +190,8 @@ describe("RestGitHub", () => {
     vi.spyOn(Date, "now").mockReturnValue(5000);
     const e2 = await rig({ [k]: { status: 429, headers: { "retry-after": "30" } } }).gh.repoSizeKb().catch((x) => x);
     expect(e2.resetAt).toBe(35000);
+    const e3 = await rig({ [k]: { status: 403, headers: { "x-ratelimit-remaining": "0" } } }).gh.repoSizeKb().catch((x) => x);
+    expect(e3.resetAt).toBe(65000);
     vi.restoreAllMocks();
     await expect(rig({ [k]: { status: 500 } }).gh.repoSizeKb()).rejects.toMatchObject({ name: "HttpError", status: 500 });
   });

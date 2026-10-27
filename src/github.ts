@@ -44,8 +44,11 @@ export class RestGitHub implements GitHubApi {
     if (o.conflict?.includes(r.status)) throw new ShaConflictError(o.conflictPath);
     if (r.status === 401) throw new AuthError();
     if (r.status === 403 || r.status === 429) {
-      if (hdr(r, "x-ratelimit-remaining") === "0") throw new RateLimitError(Number(hdr(r, "x-ratelimit-reset")) * 1000);
       const ra = hdr(r, "retry-after");
+      const reset = Number(hdr(r, "x-ratelimit-reset")) * 1000;
+      if (hdr(r, "x-ratelimit-remaining") === "0") {
+        throw new RateLimitError(Number.isFinite(reset) ? reset : Date.now() + (ra !== undefined && Number.isFinite(Number(ra)) ? Number(ra) * 1000 : 60_000));
+      }
       if (ra !== undefined) throw new RateLimitError(Date.now() + Number(ra) * 1000);
     }
     throw new HttpError(r.status);
@@ -83,7 +86,8 @@ export class RestGitHub implements GitHubApi {
   async commitBatch(baseCommit: string, changes: { path: string; text: string | null }[], message: string) {
     const post = async (p: string, body: unknown) => JSON.parse((await this.req("POST", p, { body })).text);
     const tree = changes.map((c) => ({ path: c.path, mode: "100644", type: "blob", ...(c.text === null ? { sha: null } : { content: c.text }) }));
-    const t = await post("/git/trees", { base_tree: baseCommit, tree });
+    const base = JSON.parse((await this.req("GET", `/git/commits/${baseCommit}`)).text);
+    const t = await post("/git/trees", { base_tree: base.tree.sha as string, tree });
     const c = await post("/git/commits", { message, tree: t.sha, parents: [baseCommit] });
     await this.req("PATCH", "/git/refs/heads/main", { body: { sha: c.sha, force: false }, conflict: [422] });
     return { commitSha: c.sha as string };
