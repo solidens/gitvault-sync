@@ -18,6 +18,14 @@ describe("FakeFs", () => {
     await fs.trash("a/b.md");
     expect(await fs.stat("a/b.md")).toBeNull();
   });
+  it("caseInsensitive: one file per case-folded name, keeps original case", async () => {
+    const fs = new FakeFs({ caseInsensitive: true });
+    await fs.write("Note.md", buf("a"));
+    await fs.write("note.md", buf("b"));
+    expect(fs.paths()).toEqual(["Note.md"]);
+    expect(await text(fs, "NOTE.md")).toBe("b");
+    expect((await fs.stat("note.md"))?.path).toBe("Note.md");
+  });
   it("nfd lists NFD paths but accepts both forms", async () => {
     const fs = new FakeFs({ nfd: true });
     await fs.write(NFC, buf("x"));

@@ -521,8 +521,8 @@ test("repo emptied (head → null) never trashes local files", async () => {
   expect(fTree(fake)).toHaveLength(30); // treated as first upload
 });
 
-test("remote path differing only by case → conflict copy", async () => {
-  const { A, B } = await pair({});
+test("remote path differing only by case → conflict copy on a case-insensitive disk", async () => {
+  const { A, B } = await pair({}, { caseInsensitive: true });
   B.fs.set("Note.md", "mine");
   A.fs.set("note.md", "theirs");
   await A.engine.sync();
@@ -543,4 +543,68 @@ test(".obsidian json merged key-wise when syncConfig", async () => {
   expect((await B.engine.sync()).conflicts).toEqual([]);
   await A.engine.sync();
   for (const d of [A, B]) expect(JSON.parse(await text(d.fs, ".obsidian/app.json"))).toEqual({ a: 2, b: 5, c: 3 });
+});
+
+test("two remote case variants on a fresh case-insensitive device → original + copy, remote untouched", async () => {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A", at), C = makeDevice(fake, keys, "C", { ...at, caseInsensitive: true });
+  A.fs.set("Note.md", "upper");
+  A.fs.set("note.md", "lower");
+  await A.engine.sync();
+  const r = await C.engine.sync();
+  expect(r.conflicts).toHaveLength(1);
+  const copy = r.conflicts[0];
+  expect(C.fs.paths()).toHaveLength(2);
+  const [orig] = C.fs.paths().filter((p) => p !== copy);
+  expect(await text(C.fs, copy)).toBe(orig === "Note.md" ? "lower" : "upper");
+  for (const d of [C, A, C, A]) expect((await d.engine.sync()).deleted).toEqual([]);
+  expect(await text(A.fs, "Note.md")).toBe("upper");
+  expect(await text(A.fs, "note.md")).toBe("lower");
+  const D = makeDevice(fake, keys, "D"); // case-sensitive disk: both variants, no extra copy
+  expect((await D.engine.sync()).conflicts).toEqual([]);
+  expect(await text(D.fs, "Note.md")).toBe("upper");
+  expect(await text(D.fs, "note.md")).toBe("lower");
+});
+
+for (const caseInsensitive of [false, true]) {
+  test(`case-only rename is applied without a conflict copy (caseInsensitive=${caseInsensitive})`, async () => {
+    const { fake, keys, A, B } = await pair({ "note.md": "n", "other.md": "o" }, { caseInsensitive });
+    A.fs.remove("note.md");
+    A.fs.set("Note.md", "n");
+    await A.engine.sync();
+    expect((await B.engine.sync()).conflicts).toEqual([]);
+    await B.engine.sync();
+    expect(B.fs.paths()).toEqual(["Note.md", "other.md"]);
+    for (const d of [A, B]) expect((await d.engine.sync()).deleted).toEqual([]);
+    const D = makeDevice(fake, keys, "D");
+    await D.engine.sync();
+    expect(D.fs.paths()).toEqual(["Note.md", "other.md"]);
+  });
+}
+
+test("remote path colliding by case with an ignored local file → conflict copy, not deferred forever", async () => {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A", at);
+  const C = makeDevice(fake, keys, "C", { ...at, caseInsensitive: true, settings: { ignore: ["Private/**"] } });
+  C.fs.set("Private/x.md", "local secret");
+  A.fs.set("private/x.md", "remote");
+  await A.engine.sync();
+  const r = await C.engine.sync();
+  expect(r.deferred).toEqual([]);
+  expect(r.conflicts).toEqual(["private/x (conflict C 2026-10-27 1405).md"]);
+  expect(await text(C.fs, "Private/x.md")).toBe("local secret");
+  expect(await C.engine.sync()).toMatchObject({ deferred: [], conflicts: [] });
+});
+
+test("one creation offsets only one deletion of identical files", async () => {
+  const asked: number[] = [];
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A", { confirmMassDelete: async (n) => (asked.push(n), false) });
+  for (let i = 0; i < 20; i++) A.fs.set(`n${i}.md`, "same");
+  await A.engine.sync();
+  for (let i = 0; i < 15; i++) A.fs.remove(`n${i}.md`);
+  A.fs.set("moved.md", "same");
+  await A.engine.sync();
+  expect(asked).toEqual([14]);
+  expect(fTree(fake)).toHaveLength(21);
 });

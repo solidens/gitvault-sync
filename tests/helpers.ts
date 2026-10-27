@@ -23,13 +23,14 @@ export function makeDevice(
   name: string,
   opts: {
     nfd?: boolean;
+    caseInsensitive?: boolean;
     settings?: Partial<EngineSettings>;
     bucket?: TokenBucket;
     confirmMassDelete?: (count: number, total: number) => Promise<boolean>;
     now?: () => number;
   } = {},
 ) {
-  const fs = new FakeFs({ nfd: opts.nfd });
+  const fs = new FakeFs({ nfd: opts.nfd, caseInsensitive: opts.caseInsensitive });
   const store = new MemoryStateStore();
   const api = fake.client();
   const now = opts.now ?? (() => Date.now());

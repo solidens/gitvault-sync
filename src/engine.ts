@@ -66,8 +66,10 @@ export class SyncEngine {
 
     // 2. Local scan: rehash only files whose mtime/size changed.
     const local = new Map<string, Local>();
+    const lower = new Map<string, string>(); // lowercased -> path of every file on disk, synced or not (case-insensitive disks)
     for (const st of await fs.list(settings.syncConfig)) {
       const p = nfc(st.path);
+      lower.set(p.toLowerCase(), p);
       if (skip(p)) continue;
       if (st.size > settings.maxFileBytes) {
         tooLarge.add(p);
@@ -116,8 +118,9 @@ export class SyncEngine {
     // 3. Pull / decide pushes. Deletions are collected and run after the mass-delete guard.
     let pushes: Push[] = [];
     const trashes: { p: string; loc: Local }[] = [];
-    const created = new Set<string>(); // localHash of files new this cycle: a deletion with a matching creation is a rename
-    const lower = new Map([...local.keys()].map((q) => [q.toLowerCase(), q]));
+    const created = new Map<string, number>(); // localHash -> files new this cycle; each offsets one deletion (a rename)
+    const create = (h: string) => created.set(h, (created.get(h) ?? 0) + 1);
+    let again = false; // something waits for the next cycle: keep the old head
     const taken = (q: string) => local.has(q) || remote.has(q) || !!state.files[q];
     const newPush = async (q: string, st: { mtime: number; size: number }, hash: string): Promise<Push> =>
       ({ path: q, token: await pathToken(keys, q), prev: null, local: { diskPath: q, mtime: st.mtime, size: st.size, hash } });
@@ -135,7 +138,7 @@ export class SyncEngine {
       if (!localChanged && !remoteChanged) continue;
 
       if (!remoteChanged) {
-        if (!rec && loc) created.add(loc.hash);
+        if (!rec && loc) create(loc.hash);
         pushes.push({ path: p, token: rec?.token ?? await pathToken(keys, p), prev: rem?.sha ?? null, local: loc ?? null });
         continue;
       }
@@ -153,17 +156,26 @@ export class SyncEngine {
 
       if (!loc) { // new on GitHub, or edited there and deleted here (edit beats delete)
         const other = lower.get(p.toLowerCase());
-        if (other && other !== p) { // would overwrite `other` on a case-insensitive disk
+        // p not scanned but the disk finds it: a case-insensitive disk resolves p to `other`
+        const collides = !!other && other !== p && !!(await fs.stat(p));
+        if (collides && trashes.some((t) => t.p === other)) { // case-only rename: write once the old name is gone
+          if (!rec) create(hash);
+          again = true;
+          continue;
+        }
+        if (collides) { // writing would overwrite `other`
           const cp = await this.conflictName(p, taken);
           const st = await fs.write(cp, data);
+          lower.set(cp.toLowerCase(), cp);
           state.files[p] = { token: rem.token, blobSha: rem.sha, localHash: CASE_COLLISION, mtime: -1, size: -1 };
           pushes.push(await newPush(cp, st, hash));
           report.conflicts.push(cp);
           continue;
         }
         if (await this.changedSinceScan(p)) { report.deferred.push(p); continue; }
-        if (!rec) created.add(hash);
+        if (!rec) create(hash);
         synced(await fs.write(p, data));
+        lower.set(p.toLowerCase(), p);
         report.pulled.push(p);
         continue;
       }
@@ -192,6 +204,7 @@ export class SyncEngine {
       // conflict copy: local version under a new name, remote keeps the path
       const cp = await this.conflictName(p, taken);
       const cst = await fs.write(cp, mine);
+      lower.set(cp.toLowerCase(), cp);
       synced(await fs.write(loc.diskPath, data));
       pushes.push(await newPush(cp, cst, loc.hash));
       report.conflicts.push(cp);
@@ -200,7 +213,11 @@ export class SyncEngine {
 
     // Mass-delete guard (both directions); renames don't count.
     const deletions = [...trashes.map((t) => t.p), ...pushes.filter((x) => !x.local).map((x) => x.path)]
-      .filter((p) => !created.has(state.files[p].localHash));
+      .filter((p) => {
+        const h = state.files[p].localHash, n = created.get(h) ?? 0;
+        if (n) created.set(h, n - 1);
+        return !n;
+      });
     const deleteOk = !(deletions.length > total * settings.massDeletePercent / 100 && deletions.length > settings.massDeleteMin)
       || await this.d.confirmMassDelete(deletions.length, total);
     if (deleteOk) {
@@ -213,7 +230,7 @@ export class SyncEngine {
     } else pushes = pushes.filter((x) => x.local);
 
     // Keep the old head when something was put off, so the next cycle sees those remote changes again.
-    if (!head.notModified && deleteOk && !report.deferred.length) {
+    if (!head.notModified && deleteOk && !again && !report.deferred.length) {
       state.headSha = head.sha;
       state.refEtag = head.etag || null;
     }

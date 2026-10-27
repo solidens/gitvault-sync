@@ -5,56 +5,65 @@ const nfc = (p: string) => p.normalize("NFC");
 const enc = (d: string | ArrayBuffer): ArrayBuffer =>
   typeof d === "string" ? (new TextEncoder().encode(d).buffer as ArrayBuffer) : d;
 
+/** caseInsensitive: like APFS/NTFS — lookups ignore case, a file keeps the case it was created with. */
 export class FakeFs implements LocalFs {
   nfd = false;
+  caseInsensitive = false;
   onBeforeWrite?: (path: string) => void | Promise<void>;
-  private files = new Map<string, { data: ArrayBuffer; mtime: number }>();
+  private files = new Map<string, { path: string; data: ArrayBuffer; mtime: number }>();
   private clock = 0;
 
-  constructor(opts: { nfd?: boolean } = {}) {
+  constructor(opts: { nfd?: boolean; caseInsensitive?: boolean } = {}) {
     this.nfd = opts.nfd ?? false;
+    this.caseInsensitive = opts.caseInsensitive ?? false;
   }
 
-  private st(p: string): FileStat {
-    const f = this.files.get(p)!;
-    return { path: this.nfd ? p.normalize("NFD") : p, mtime: f.mtime, size: f.data.byteLength };
+  private key(path: string): string {
+    return this.caseInsensitive ? nfc(path).toLowerCase() : nfc(path);
+  }
+  private st(k: string): FileStat {
+    const f = this.files.get(k)!;
+    return { path: this.nfd ? f.path.normalize("NFD") : f.path, mtime: f.mtime, size: f.data.byteLength };
+  }
+  private put(path: string, data: ArrayBuffer): void {
+    const k = this.key(path);
+    this.files.set(k, { path: this.files.get(k)?.path ?? nfc(path), data: data.slice(0), mtime: ++this.clock });
   }
 
   async list(includeConfig: boolean): Promise<FileStat[]> {
     return [...this.files.keys()]
-      .filter((p) => includeConfig || !p.startsWith(".obsidian/"))
-      .map((p) => this.st(p));
+      .filter((k) => includeConfig || !this.files.get(k)!.path.startsWith(".obsidian/"))
+      .map((k) => this.st(k));
   }
   async read(path: string): Promise<ArrayBuffer> {
-    const f = this.files.get(nfc(path));
+    const f = this.files.get(this.key(path));
     if (!f) throw new Error(`ENOENT: ${path}`);
     return f.data.slice(0);
   }
   async stat(path: string): Promise<FileStat | null> {
-    return this.files.has(nfc(path)) ? this.st(nfc(path)) : null;
+    return this.files.has(this.key(path)) ? this.st(this.key(path)) : null;
   }
   async write(path: string, data: ArrayBuffer): Promise<FileStat> {
-    const p = nfc(path);
-    await this.onBeforeWrite?.(p);
-    this.files.set(p, { data: data.slice(0), mtime: ++this.clock });
-    return this.st(p);
+    await this.onBeforeWrite?.(nfc(path));
+    this.put(path, data);
+    return this.st(this.key(path));
   }
   async trash(path: string): Promise<void> {
-    this.files.delete(nfc(path));
+    this.files.delete(this.key(path));
   }
 
   // sync test helpers; set() counts as a user edit
   set(path: string, data: string | ArrayBuffer): void {
-    this.files.set(nfc(path), { data: enc(data).slice(0), mtime: ++this.clock });
+    this.put(path, enc(data));
   }
   remove(path: string): void {
-    this.files.delete(nfc(path));
+    this.files.delete(this.key(path));
   }
   has(path: string): boolean {
-    return this.files.has(nfc(path));
+    return this.files.has(this.key(path));
   }
   paths(): string[] {
-    return [...this.files.keys()].sort();
+    return [...this.files.values()].map((f) => f.path).sort();
   }
 }
 
