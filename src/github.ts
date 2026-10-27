@@ -4,13 +4,18 @@ import { b64encode } from "./util";
 
 export type Head = { notModified: true } | { notModified: false; sha: string | null; etag: string }; // sha null = empty repo
 
+export interface BatchChange { path: string; text: string | null | (() => Promise<string>) }
+/** Characters of file content per POST /git/trees; bigger batches chain several trees into one commit. */
+export const BATCH_CHUNK_CHARS = 20 * 1024 * 1024;
+
 export interface GitHubApi {
   getHead(etag: string | null): Promise<Head>;
   getTree(commitSha: string): Promise<Map<string, string>>; // repo path -> blob sha, blobs only
   getBlobText(blobSha: string): Promise<string>;
   putFile(path: string, text: string, prevBlobSha: string | null, message: string): Promise<{ blobSha: string; commitSha: string }>;
   deleteFile(path: string, prevBlobSha: string, message: string): Promise<{ commitSha: string }>;
-  commitBatch(baseCommit: string, changes: { path: string; text: string | null }[], message: string): Promise<{ commitSha: string }>;
+  /** text null = delete; a function is called when its chunk is sent, so the whole batch is never in memory at once. */
+  commitBatch(baseCommit: string, changes: BatchChange[], message: string): Promise<{ commitSha: string }>;
   getTarball(commitSha: string): Promise<Map<string, string>>; // repo path -> text
   fileHistoryBlobShas(path: string, limit: number): Promise<string[]>;
   repoSizeKb(): Promise<number>;
@@ -23,7 +28,7 @@ const enc = (path: string): string => path.split("/").map(encodeURIComponent).jo
 
 export class RestGitHub implements GitHubApi {
   private base: string;
-  constructor(private http: Http, owner: string, repo: string, private token: () => string) {
+  constructor(private http: Http, owner: string, repo: string, private token: () => string, private chunkChars = BATCH_CHUNK_CHARS) {
     this.base = `https://api.github.com/repos/${owner}/${repo}`;
   }
 
@@ -51,6 +56,8 @@ export class RestGitHub implements GitHubApi {
         throw new RateLimitError(Number.isFinite(reset) ? reset : Date.now() + (ra !== undefined && Number.isFinite(Number(ra)) ? Number(ra) * 1000 : 60_000));
       }
       if (ra !== undefined) throw new RateLimitError(Date.now() + Number(ra) * 1000);
+      // secondary rate limit: no headers to go by, so back off a minute instead of hammering every few seconds
+      if (/rate limit|abuse/i.test(r.text)) throw new RateLimitError(Date.now() + 60_000);
     }
     throw new HttpError(r.status);
   }
@@ -84,12 +91,19 @@ export class RestGitHub implements GitHubApi {
     return { commitSha: j.commit.sha as string };
   }
 
-  async commitBatch(baseCommit: string, changes: { path: string; text: string | null }[], message: string) {
+  async commitBatch(baseCommit: string, changes: BatchChange[], message: string) {
     const post = async (p: string, body: unknown) => JSON.parse((await this.req("POST", p, { body })).text);
-    const tree = changes.map((c) => ({ path: c.path, mode: "100644", type: "blob", ...(c.text === null ? { sha: null } : { content: c.text }) }));
-    const base = JSON.parse((await this.req("GET", `/git/commits/${baseCommit}`)).text);
-    const t = await post("/git/trees", { base_tree: base.tree.sha as string, tree });
-    const c = await post("/git/commits", { message, tree: t.sha, parents: [baseCommit] });
+    let treeSha = JSON.parse((await this.req("GET", `/git/commits/${baseCommit}`)).text).tree.sha as string;
+    let tree: object[] = [], size = 0;
+    const flush = async () => { treeSha = (await post("/git/trees", { base_tree: treeSha, tree })).sha; tree = []; size = 0; };
+    for (const ch of changes) {
+      const text = typeof ch.text === "function" ? await ch.text() : ch.text;
+      if (tree.length && text !== null && size + text.length > this.chunkChars) await flush();
+      tree.push({ path: ch.path, mode: "100644", type: "blob", ...(text === null ? { sha: null } : { content: text }) });
+      size += text?.length ?? 0;
+    }
+    await flush();
+    const c = await post("/git/commits", { message, tree: treeSha, parents: [baseCommit] });
     await this.req("PATCH", "/git/refs/heads/main", { body: { sha: c.sha, force: false }, conflict: [422] });
     return { commitSha: c.sha as string };
   }

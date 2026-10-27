@@ -1,4 +1,4 @@
-import type { GitHubApi, Head } from "../src/github";
+import type { BatchChange, GitHubApi, Head } from "../src/github";
 import { ShaConflictError } from "../src/http";
 import { gitBlobSha } from "../src/util";
 
@@ -94,7 +94,9 @@ export class FakeGitHub implements GitHubApi {
     tree.delete(path);
     return { commitSha: this.commit(tree, message) };
   }
-  async commitBatch(baseCommit: string, changes: { path: string; text: string | null }[], message: string) {
+  async commitBatch(baseCommit: string, lazy: BatchChange[], message: string) {
+    const changes: { path: string; text: string | null }[] = [];
+    for (const c of lazy) changes.push({ path: c.path, text: typeof c.text === "function" ? await c.text() : c.text });
     const shas = await Promise.all(changes.map((c) => (c.text === null ? null : gitBlobSha(c.text))));
     await this.write("commitBatch", 3);
     if (this.head !== baseCommit) throw new ShaConflictError();

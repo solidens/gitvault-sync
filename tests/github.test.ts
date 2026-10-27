@@ -96,12 +96,8 @@ describe("FakeGitHub", () => {
     const fake = new FakeGitHub();
     const a = fake.client(), b = fake.client();
     const base = await a.putFile("x", "1", null, "m");
-    const [r1, r2] = await Promise.allSettled([
-      b.putFile("y", "2", null, "m"),
-      a.commitBatch(base.commitSha, [{ path: "z", text: "3" }], "m"),
-    ]);
-    expect(r1.status).toBe("fulfilled");
-    expect(r2.status).toBe("rejected");
+    await b.putFile("y", "2", null, "m");
+    await expect(a.commitBatch(base.commitSha, [{ path: "z", text: "3" }], "m")).rejects.toBeInstanceOf(ShaConflictError);
     expect([...(await fake.getTree(fake.head!)).keys()].sort()).toEqual(["x", "y"]);
   });
 });
@@ -168,6 +164,26 @@ describe("RestGitHub", () => {
     expect(JSON.parse(calls[3]!.body as string)).toEqual({ sha: "c2", force: false });
     await expect(rig({ ...replies, [`PATCH ${B}/git/refs/heads/main`]: { status: 422 } }).gh.commitBatch("c1", [], "m")).rejects.toBeInstanceOf(ShaConflictError);
   });
+  test("commitBatch over the chunk size chains trees, loads text lazily, one commit", async () => {
+    const calls: HttpRequest[] = [];
+    let trees = 0;
+    const http: Http = async (req) => {
+      calls.push(req);
+      const json = req.url.endsWith("/git/commits/c1") ? { tree: { sha: "t0" } } : req.url.endsWith("/git/trees") ? { sha: `t${++trees}` } : { sha: "c2" };
+      return { status: 200, headers: {}, text: JSON.stringify(json), arrayBuffer: new ArrayBuffer(0) };
+    };
+    const gh = new RestGitHub(http, "o", "r", () => "tok", 10);
+    const loaded: string[] = [];
+    const lazy = (p: string, t: string) => ({ path: p, text: async () => { loaded.push(`${p}@${calls.length}`); return t; } });
+    await gh.commitBatch("c1", [lazy("a", "123456"), lazy("b", "1234"), lazy("c", "12345"), { path: "d", text: null }], "m");
+    expect(calls.map((c) => `${c.method} ${c.url.slice(B.length)}`)).toEqual([
+      "GET /git/commits/c1", "POST /git/trees", "POST /git/trees", "POST /git/commits", "PATCH /git/refs/heads/main",
+    ]);
+    const bodies = calls.slice(1, 3).map((c) => JSON.parse(c.body as string));
+    expect(bodies.map((b) => [b.base_tree, b.tree.map((e: { path: string }) => e.path)])).toEqual([["t0", ["a", "b"]], ["t1", ["c", "d"]]]);
+    expect(JSON.parse(calls[3]!.body as string)).toEqual({ message: "m", tree: "t2", parents: ["c1"] });
+    expect(loaded).toEqual(["a@1", "b@1", "c@1"]); // c loaded only after the first chunk was ready, before it was sent
+  });
   test("fileHistoryBlobShas skips 404", async () => {
     const { gh } = rig({
       [`GET ${B}/commits?path=p&per_page=2`]: { json: [{ sha: "c2" }, { sha: "c1" }] },
@@ -190,6 +206,12 @@ describe("RestGitHub", () => {
     expect(e2.resetAt).toBe(35000);
     const e3 = await rig({ [k]: { status: 403, headers: { "x-ratelimit-remaining": "0" } } }).gh.repoSizeKb().catch((x) => x);
     expect(e3.resetAt).toBe(65000);
+    for (const [status, text] of [[403, '{"message":"You have exceeded a secondary rate limit."}'], [429, "abuse detection"]] as const) {
+      const e4 = await rig({ [k]: { status, text } }).gh.repoSizeKb().catch((x) => x);
+      expect(e4).toBeInstanceOf(RateLimitError);
+      expect(e4.resetAt).toBe(65000);
+    }
+    await expect(rig({ [k]: { status: 403, text: '{"message":"Resource not accessible"}' } }).gh.repoSizeKb()).rejects.toMatchObject({ name: "HttpError", status: 403 });
     vi.restoreAllMocks();
     await expect(rig({ [k]: { status: 500 } }).gh.repoSizeKb()).rejects.toMatchObject({ name: "HttpError", status: 500 });
   });

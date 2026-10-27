@@ -393,12 +393,22 @@ export class SyncEngine {
     // Git Data API needs an existing commit, so an empty repo always goes file by file.
     if (base !== null && pushes.length > settings.batchThreshold) {
       if (!bucket.tryTake(3)) return limited(3);
-      // shortcut: one request for the whole batch; split into ~20 MB chunks when first uploads of big vaults hit the request limit.
-      const items = await Promise.all(pushes.map(async (x) => ({ x, e: x.local ? await encrypt(x, x.local) : null })));
-      await api.commitBatch(base, items.map(({ x, e }) => ({ path: repoPath(x.token), text: e?.text ?? null })), msg(pushes.length));
-      for (const { x, e } of items) {
-        if (x.local && e) record(x, x.local, await gitBlobSha(e.text), e.hash);
-        else forget(x);
+      // encrypted lazily, chunk by chunk; only blob sha + hash are kept
+      const sent = new Map<string, { blobSha: string; hash: string }>();
+      const changes = pushes.map((x) => ({
+        path: repoPath(x.token),
+        text: x.local ? async () => {
+          const e = await encrypt(x, x.local!);
+          sent.set(x.path, { blobSha: await gitBlobSha(e.text), hash: e.hash });
+          return e.text;
+        } : null,
+      }));
+      await api.commitBatch(base, changes, msg(pushes.length));
+      for (const x of pushes) {
+        const e = sent.get(x.path);
+        if (!x.local) forget(x);
+        else if (e) record(x, x.local, e.blobSha, e.hash);
+        else throw new Error(`batch did not send ${x.path}`);
       }
       await store.save(state);
       return;

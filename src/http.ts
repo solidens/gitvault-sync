@@ -19,5 +19,6 @@ export class ShaConflictError extends Error {
 
 export const obsidianHttp: Http = async (req) => {
   const r = await requestUrl({ url: req.url, method: req.method, headers: req.headers, body: req.body, throw: false });
-  return { status: r.status, headers: r.headers, text: r.text, arrayBuffer: r.arrayBuffer };
+  // lazy: decoding a tarball as text would waste memory, reading JSON as a buffer too
+  return { status: r.status, headers: r.headers, get text() { return r.text; }, get arrayBuffer() { return r.arrayBuffer; } };
 };
