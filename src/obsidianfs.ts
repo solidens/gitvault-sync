@@ -1,4 +1,4 @@
-import { TFile, type App, type DataAdapter } from "obsidian";
+import { TFile, TFolder, type App, type DataAdapter } from "obsidian";
 import { type FileStat, LocalChangedError, type LocalFs } from "./localfs";
 import type { StateStore, SyncState } from "./state";
 
@@ -34,6 +34,9 @@ export class ObsidianFs implements LocalFs {
 
   async list(includeConfig: boolean): Promise<FileStat[]> {
     const out: FileStat[] = this.app.vault.getFiles().map((f) => ({ path: f.path, mtime: f.stat.mtime, size: f.stat.size }));
+    for (const f of this.app.vault.getAllLoadedFiles()) {
+      if (f instanceof TFolder && !f.isRoot() && f.children.length === 0) out.push({ path: f.path + "/", mtime: 0, size: 0 });
+    }
     if (!includeConfig) return out;
     const walk = async (dir: string): Promise<void> => {
       const l = await this.adapter.list(dir);
@@ -48,17 +51,20 @@ export class ObsidianFs implements LocalFs {
   }
 
   read(path: string): Promise<ArrayBuffer> {
+    if (path.endsWith("/")) return Promise.resolve(new ArrayBuffer(0));
     return this.adapter.readBinary(path);
   }
 
   // Deliberately the adapter, not vault.getAbstractFileByPath: the engine's case-collision check needs
   // stat("note.md") to find "Note.md" on case-insensitive disks (APFS/NTFS); the vault index is case-sensitive.
   async stat(path: string): Promise<FileStat | null> {
+    if (path.endsWith("/")) return (await this.adapter.stat(path.slice(0, -1)))?.type === "folder" ? { path, mtime: 0, size: 0 } : null;
     const st = await this.adapter.stat(path);
     return st && st.type === "file" ? { path, mtime: st.mtime, size: st.size } : null;
   }
 
   async write(path: string, data: ArrayBuffer, expected?: ArrayBuffer | null): Promise<FileStat> {
+    if (path.endsWith("/")) { await this.mkdirs(path); return { path, mtime: 0, size: 0 }; } // idempotent: an existing folder is fine
     const existing = this.file(path);
     if (expected === null && (existing || await this.adapter.exists(path))) throw new LocalChangedError(path);
     const text = existing && expected ? exactText(data) : null, want = text !== null && expected ? exactText(expected) : null;
@@ -82,6 +88,11 @@ export class ObsidianFs implements LocalFs {
   }
 
   async trash(path: string): Promise<void> {
+    if (path.endsWith("/")) {
+      const d = this.app.vault.getAbstractFileByPath(path.slice(0, -1));
+      if (d instanceof TFolder && d.children.length === 0) await this.app.vault.trash(d, true);
+      return; // still holds files: it stays
+    }
     const f = this.file(path);
     if (f) return this.app.vault.trash(f, true);
     if (!(await this.adapter.trashSystem(path))) await this.adapter.trashLocal(path);
@@ -93,7 +104,8 @@ export class ObsidianFs implements LocalFs {
     for (const p of parts) {
       cur = cur ? `${cur}/${p}` : p;
       if (await this.adapter.exists(cur)) continue;
-      try { await this.adapter.mkdir(cur); } catch (e) { if (!(await this.adapter.exists(cur))) throw e; }
+      // vault.createFolder keeps the vault index in step (folders must be TFolder for list() and trash())
+      try { await (this.isConfig(cur) ? this.adapter.mkdir(cur) : this.app.vault.createFolder(cur)); } catch (e) { if (!(await this.adapter.exists(cur))) throw e; }
     }
   }
 }

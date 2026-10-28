@@ -35,6 +35,7 @@ function rig() {
     },
     modifyBinary: async (f: TFile, d: ArrayBuffer) => { calls.push(`modifyBinary ${f.path}`); disk.set(f.path, d); },
     createBinary: async (p: string, d: ArrayBuffer) => { calls.push(`createBinary ${p}`); disk.set(p, d); },
+    createFolder: async (p: string) => { calls.push(`createFolder ${p}`); },
   };
   return { fs: new ObsidianFs({ vault } as unknown as App), disk, editor, calls, adapter: adapter as unknown as DataAdapter };
 }
@@ -84,4 +85,29 @@ test("CAS ignores CRLF→LF and a dropped BOM in the editor's text", async () =>
   editor.set("n.md", "﻿a\nb");
   await fs.write("n.md", buf("new"), buf("a\r\nb"));
   expect(td.decode(disk.get("n.md")!)).toBe("new");
+});
+
+test("folders: listed only when empty, written via createFolder, trashed only while empty", async () => {
+  const { TFolder } = await import("obsidian");
+  const empty = Object.assign(new TFolder(), { path: "a/e", children: [] });
+  const full = Object.assign(new TFolder(), { path: "a", children: [empty] });
+  const trashed: string[] = [], made: string[] = [];
+  const vault = {
+    configDir: ".obsidian",
+    adapter: { exists: async () => false, stat: async (p: string) => (p === "a/e" || p === "a" ? { type: "folder" } : null), mkdir: async () => {} },
+    getFiles: () => [],
+    getAllLoadedFiles: () => [Object.assign(new TFolder(), { path: "/" }), full, empty],
+    getAbstractFileByPath: (p: string) => ({ a: full, "a/e": empty } as Record<string, unknown>)[p] ?? null,
+    createFolder: async (p: string) => void made.push(p),
+    trash: async (f: { path: string }) => void trashed.push(f.path),
+  };
+  const fs = new ObsidianFs({ vault } as unknown as App);
+  expect((await fs.list(false)).map((f) => f.path)).toEqual(["a/e/"]);
+  expect(await fs.stat("a/e/")).toEqual({ path: "a/e/", mtime: 0, size: 0 });
+  expect(new Uint8Array(await fs.read("a/e/")).length).toBe(0);
+  await fs.write("x/y/", new ArrayBuffer(0), null);
+  expect(made).toEqual(["x", "x/y"]);
+  await fs.trash("a/");
+  await fs.trash("a/e/");
+  expect(trashed).toEqual(["a/e"]);
 });

@@ -984,3 +984,48 @@ test("file name Obsidian can't create is skipped, not fatal, and never deleted r
   expect((await A.engine.sync()).deleted).toEqual([]);
   expect(fTree(fake)).toHaveLength(2);
 });
+
+test("empty folders sync, and are removed after their files when deleted", async () => {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A"), B = makeDevice(fake, keys, "B");
+  A.fs.mkdir("Проекты/Пусто");
+  A.fs.set("Проекты/Идея/n.md", "x");
+  await A.engine.sync();
+  await B.engine.sync();
+  expect(B.fs.paths()).toEqual(["Проекты/Идея/n.md", "Проекты/Пусто/"]);
+  // a file appears in the empty folder: no longer an entry, but the folder stays everywhere
+  B.fs.set("Проекты/Пусто/m.md", "m");
+  await B.engine.sync();
+  await A.engine.sync();
+  expect(A.fs.paths()).toEqual(["Проекты/Идея/n.md", "Проекты/Пусто/m.md"]);
+  // deleting the file leaves the (now empty) folder, like Obsidian does; then delete the folder too
+  A.fs.remove("Проекты/Пусто/m.md");
+  A.fs.mkdir("Проекты/Пусто");
+  await A.engine.sync();
+  await B.engine.sync();
+  expect(B.fs.paths()).toEqual(["Проекты/Идея/n.md", "Проекты/Пусто/"]);
+  A.fs.remove("Проекты/Пусто/");
+  await A.engine.sync();
+  await B.engine.sync();
+  expect(B.fs.paths()).toEqual(["Проекты/Идея/n.md"]);
+  await A.engine.sync();
+  expect(A.fs.paths()).toEqual(["Проекты/Идея/n.md"]);
+});
+
+test("a deleted folder with files: files go first, then the folder; nothing resurrects", async () => {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A"), B = makeDevice(fake, keys, "B");
+  A.fs.mkdir("d/e");
+  A.fs.set("d/x.md", "x");
+  await A.engine.sync();
+  await B.engine.sync();
+  B.fs.mkdir("d"); // on B the parent folder exists too
+  A.fs.remove("d/x.md"); A.fs.remove("d/e/");
+  await A.engine.sync();
+  await B.engine.sync();
+  await B.engine.sync();
+  await A.engine.sync();
+  expect(fTree(fake)).toHaveLength(0);
+  expect(B.fs.paths()).toEqual([]);
+  expect(A.fs.paths()).toEqual([]);
+});

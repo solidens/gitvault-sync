@@ -320,12 +320,16 @@ export class SyncEngine {
     const deleteOk = !(deletions.length > total * settings.massDeletePercent / 100 && deletions.length > settings.massDeleteMin)
       || await this.d.confirmMassDelete(deletions.length, total);
     if (deleteOk) {
+      // folders last, deepest first: a folder is trashed only once the files deleted with it are gone
+      const order = (p: string) => (p.endsWith("/") ? 1000 - p.split("/").length : 0);
+      trashes.sort((a, b) => order(a.p) - order(b.p));
       for (const { p, loc } of trashes) {
         if (!(await this.scanned(loc))) { report.deferred.push(p); continue; }
         await fs.trash(loc.diskPath);
         report.deleted.push(p);
         delete state.files[p];
       }
+      await this.trashEmptiedParents(trashes, [...remote.keys(), ...pushes.map((x) => x.path)]);
     } else pushes = pushes.filter((x) => x.local);
 
     // Keep the old head when something was put off, so the next cycle sees those remote changes again.
@@ -393,6 +397,21 @@ export class SyncEngine {
     }
     if (json) return mergeJson(base, local, remote);
     return base === null ? null : merge3(base, local, remote);
+  }
+
+  /** A folder emptied by remote deletions goes too, unless something still lives under it remotely; else it would sync back as an empty folder. */
+  private async trashEmptiedParents(trashed: { p: string; loc: Local }[], kept: string[]): Promise<void> {
+    const dirs = (p: string) => p.replace(/\/$/, "").split("/").slice(0, -1).map((_, i, a) => a.slice(0, i + 1).join("/") + "/");
+    const busy = new Set(kept.flatMap((p) => [...dirs(p), ...(p.endsWith("/") ? [p] : [])]));
+    const done = new Set<string>();
+    for (const { p, loc } of trashed) {
+      const ds = dirs(p), disk = dirs(loc.diskPath);
+      for (let i = ds.length - 1; i >= 0; i--) { // deepest first
+        if (busy.has(ds[i]) || done.has(ds[i])) break;
+        done.add(ds[i]);
+        await this.d.fs.trash(disk[i]); // no-op while it still holds anything locally
+      }
+    }
   }
 
   private async conflictName(p: string, taken: (q: string) => boolean): Promise<string> {
