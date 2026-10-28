@@ -39,28 +39,40 @@ export async function fetchVaultConfig(api: GitHubApi): Promise<VaultConfig | nu
   return null;
 }
 
-/** Steps 3-4 of onboarding: device flow, then pick the repo, then the password. */
+type Repo = { owner: string; repo: string };
+
+/**
+ * One entry point for every device: sign in, then the repos decide the path.
+ * A repo that already holds a vault means "join it" (password only), so a second device can't start a second vault.
+ */
 export async function login(plugin: GitvaultSync): Promise<void> {
   const token = await new DeviceFlowModal(plugin.app).run();
   if (!token) return;
   try {
-    const repos = await listInstallationRepos(obsidianHttp, token);
-    if (repos.length === 0) {
-      new Notice("Нет доступа ни к одному репозиторию: нажмите «2. Разрешить доступ» и выберите свой репозиторий");
-      return;
+    for (;;) {
+      const repos = await listInstallationRepos(obsidianHttp, token);
+      const kinds = await Promise.all(repos.map((r) =>
+        fetchVaultConfig(new RestGitHub(obsidianHttp, r.owner, r.repo, () => token)).then((c) => (c ? "vault" : "empty"), () => "other")));
+      const vaults = repos.filter((_, i) => kinds[i] === "vault"), empty = repos.filter((_, i) => kinds[i] === "empty");
+      const pool = vaults.length ? vaults : empty;
+      if (pool.length) {
+        const pick = pool.length === 1 ? pool[0]
+          : await new RepoModal(plugin.app, pool, vaults.length ? "Выберите хранилище" : "Выберите пустой репозиторий").run();
+        if (pick) await unlock(plugin, pick.owner, pick.repo, token);
+        return;
+      }
+      if (!(await new SetupModal(plugin.app).run())) return; // "Проверить снова" loops with the same token
     }
-    const pick = repos.length === 1 ? repos[0] : await new RepoModal(plugin.app, repos).run();
-    if (pick) await unlock(plugin, pick.owner, pick.repo, token);
   } catch (e) {
     new Notice(`Gitvault Sync: ${errText(e)}`);
   }
 }
 
-/** Step 5: create the vault in an empty repo, or unlock an existing one. Resolves when the modal is shown. */
+/** Create the vault in an empty repo, or unlock an existing one. Resolves when the modal is shown. */
 export async function unlock(plugin: GitvaultSync, owner: string, repo: string, token: string): Promise<void> {
   const api = new RestGitHub(obsidianHttp, owner, repo, () => token);
   const config = await fetchVaultConfig(api);
-  new PasswordModal(plugin.app, config === null, plugin.settings.rememberPassword, async (password, remember) => {
+  new PasswordModal(plugin.app, `${owner}/${repo}`, config === null, plugin.settings.rememberPassword, async (password, remember) => {
     let keys: VaultKeys;
     if (config) {
       try { keys = await unlockVault(password, config); } catch (e) {
@@ -85,29 +97,26 @@ export class GitvaultSettingTab extends PluginSettingTab {
     const s = plugin.settings;
     c.empty();
 
-    new Setting(c).setName("Подключение").setHeading();
     const token = plugin.token();
-    if (token && s.owner) {
-      const row = new Setting(c).setName("Репозиторий").setDesc(`${s.owner}/${s.repo}`);
-      if (!plugin.isRunning()) {
-        row.addButton((b) => b.setButtonText("Ввести пароль").onClick(() => {
-          unlock(plugin, s.owner, s.repo, token).catch((e) => new Notice(`Gitvault Sync: ${errText(e)}`));
-        }));
-      }
-      row.addButton((b) => b.setButtonText("Выйти").setWarning().onClick(async () => { await plugin.signOut(); this.display(); }));
-    } else {
-      new Setting(c).setName("1. Создать репозиторий").setDesc("Приватный репозиторий на GitHub; нажмите Create.")
-        .addButton((b) => b.setButtonText("Создать").onClick(() => {
-          window.open("https://github.com/new?name=obsidian-vault&visibility=private");
-        }));
-      new Setting(c).setName("2. Разрешить доступ")
-        .setDesc("Выберите «Only select repositories» и свой репозиторий, затем подтвердите вход кодом.")
-        .addButton((b) => b.setButtonText("Разрешить").setCta().onClick(async () => {
-          window.open(`https://github.com/apps/${APP_SLUG}/installations/new`);
-          await login(plugin);
-          this.display();
-        }));
+    if (!(token && s.owner)) {
+      new Setting(c).setName("Подключение").setHeading();
+      c.createEl("p", { cls: "setting-item-description", text:
+        "Хранилище синхронизируется через ваш приватный репозиторий GitHub и шифруется паролем. " +
+        "Войдите — плагин сам поймёт, первое это устройство или хранилище уже настроено на другом." });
+      new Setting(c).setName("Войти через GitHub")
+        .addButton((b) => b.setButtonText("Войти").setCta().onClick(async () => { await login(plugin); this.display(); }));
+      return;
     }
+
+    new Setting(c).setName("Подключение").setHeading();
+    const row = new Setting(c).setName(`Хранилище ${s.owner}/${s.repo}`)
+      .setDesc(plugin.isRunning() ? "Синхронизация включена." : "Пароль не введён: синхронизация остановлена.");
+    if (!plugin.isRunning()) {
+      row.addButton((b) => b.setButtonText("Ввести пароль").setCta().onClick(() => {
+        unlock(plugin, s.owner, s.repo, token).catch((e) => new Notice(`Gitvault Sync: ${errText(e)}`));
+      }));
+    }
+    row.addButton((b) => b.setButtonText("Выйти").setWarning().onClick(async () => { await plugin.signOut(); this.display(); }));
 
     new Setting(c).setName("Синхронизация").setHeading();
     // text fields save on "change" (blur/Enter), not per keystroke: each save rebuilds the engine
@@ -120,6 +129,7 @@ export class GitvaultSettingTab extends PluginSettingTab {
       }));
     new Setting(c).setName("Синхронизировать настройки и плагины").setDesc("Папка .obsidian; применится после перезапуска Obsidian.")
       .addToggle((t) => t.setValue(s.syncConfig).onChange(async (v) => { s.syncConfig = v; await plugin.saveSettings(); }));
+    new Setting(c).setName("Дополнительно").setHeading();
     new Setting(c).setName("Игнорировать").setDesc("Шаблоны путей, по одному на строку, например Attachments/** или *.pdf")
       .addTextArea((t) => onCommit(t.setValue(s.ignore.join("\n")).inputEl, async (v) => {
         s.ignore = v.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -189,7 +199,7 @@ class DeviceFlowModal extends Modal {
 
 class RepoModal extends Modal {
   private done: (r: { owner: string; repo: string } | null) => void = () => {};
-  constructor(app: App, private repos: { owner: string; repo: string }[]) { super(app); }
+  constructor(app: App, private repos: Repo[], private title: string) { super(app); }
 
   run(): Promise<{ owner: string; repo: string } | null> {
     return new Promise((resolve) => {
@@ -199,7 +209,7 @@ class RepoModal extends Modal {
   }
 
   onOpen(): void {
-    this.setTitle("Выберите репозиторий");
+    this.setTitle(this.title);
     let i = 0;
     new Setting(this.contentEl)
       .addDropdown((d) => {
@@ -215,14 +225,38 @@ class RepoModal extends Modal {
   }
 }
 
+/** No repo accessible yet: the first-device steps. Resolves true for "check again". */
+class SetupModal extends Modal {
+  private done: (again: boolean) => void = () => {};
+  run(): Promise<boolean> {
+    return new Promise((resolve) => { this.done = (v) => { this.done = () => {}; resolve(v); }; this.open(); });
+  }
+
+  onOpen(): void {
+    this.setTitle("Первое устройство");
+    const { contentEl: el } = this;
+    el.createEl("p", { text: "У приложения пока нет доступа ни к одному репозиторию. Если хранилище уже настроено на другом устройстве, войдите тем же аккаунтом GitHub. Иначе:" });
+    new Setting(el).setName("1. Создайте приватный репозиторий").setDesc("Пустой, без README.")
+      .addButton((b) => b.setButtonText("Создать").onClick(() => window.open("https://github.com/new?name=obsidian-vault&visibility=private")));
+    new Setting(el).setName("2. Дайте доступ к нему").setDesc("Выберите «Only select repositories» и этот репозиторий.")
+      .addButton((b) => b.setButtonText("Разрешить").onClick(() => window.open(`https://github.com/apps/${APP_SLUG}/installations/new`)));
+    new Setting(el).addButton((b) => b.setButtonText("Проверить снова").setCta().onClick(() => { this.done(true); this.close(); }));
+  }
+
+  onClose(): void { this.contentEl.empty(); this.done(false); }
+}
+
 /** submit returns an error message to show, or null on success. */
 class PasswordModal extends Modal {
-  constructor(app: App, private create: boolean, private remember: boolean,
+  constructor(app: App, private repo: string, private create: boolean, private remember: boolean,
     private submit: (password: string, remember: boolean) => Promise<string | null>) { super(app); }
 
   onOpen(): void {
     const { contentEl: el } = this;
-    this.setTitle(this.create ? "Задайте пароль" : "Введите пароль");
+    this.setTitle(this.create ? "Новое хранилище" : "Подключение к хранилищу");
+    el.createEl("p", { text: this.create
+      ? `Это первое устройство: в ${this.repo} будет создано хранилище. Придумайте пароль — на других устройствах вы введёте его же.`
+      : `Хранилище ${this.repo} уже настроено на другом устройстве. Введите его пароль.` });
     if (this.create) {
       el.createEl("p", { cls: "mod-warning", text: "Потерянный пароль не восстановить: без него данные в репозитории не расшифровать." });
     }

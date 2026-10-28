@@ -18,10 +18,9 @@ Sync your Obsidian vault across desktop and mobile devices through **your own pr
 ## Setup
 
 1. Install the plugin (manual install while in beta: copy `main.js`, `manifest.json`, `styles.css` from the [latest release](../../releases) into `<vault>/.obsidian/plugins/gitvault-sync/`, then enable it in **Settings → Community plugins**).
-2. In the plugin settings (the interface is currently in Russian):
-   - **Создать** (Create) — creates an empty **private** repository on GitHub;
-   - **Разрешить** (Allow) — installs the [Gitvault Sync GitHub App](https://github.com/apps/gitvault-sync) on *that repository only* and signs you in with a one-time code;
-   - set a password. On other devices, sign in the same way and enter the same password.
+2. In the plugin settings press **Войти** (Sign in) and confirm the one-time code on GitHub. The plugin picks the path itself (the interface is currently in Russian):
+   - **first device** — it walks you through creating an empty **private** repository and giving the [Gitvault Sync GitHub App](https://github.com/apps/gitvault-sync) access to *that repository only*, then you set a password;
+   - **any other device** — it finds the existing vault and only asks for the same password.
 
 Sync then runs automatically while Obsidian is open. Commands: *Синхронизировать сейчас* (sync now), *Пауза/продолжить* (pause/resume), *Показать статус* (status).
 

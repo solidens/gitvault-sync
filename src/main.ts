@@ -39,6 +39,7 @@ export default class GitvaultSync extends Plugin {
   private paused = false;
   private status = "";
   private statusEl!: HTMLElement;
+  private tab!: GitvaultSettingTab;
   private events: SyncEvent[] = [];
   private conflicts = new Set<string>();
   private warnedLarge = new Set<string>();
@@ -57,7 +58,8 @@ export default class GitvaultSync extends Plugin {
     this.statusEl = this.addStatusBarItem();
     this.statusEl.addClass("gvs-status");
     this.registerDomEvent(this.statusEl, "click", () => this.showStatus());
-    this.addSettingTab(new GitvaultSettingTab(this.app, this));
+    this.tab = new GitvaultSettingTab(this.app, this);
+    this.addSettingTab(this.tab);
 
     this.addCommand({ id: "sync-now", name: "Синхронизировать сейчас", callback: () => this.syncNow() });
     this.addCommand({ id: "toggle-pause", name: "Пауза/продолжить", callback: () => this.togglePause() });
@@ -170,7 +172,9 @@ export default class GitvaultSync extends Plugin {
     await this.saveSettings();
     if (gen !== this.gen) return;
     this.log(`Подключено к ${c.owner}/${c.repo}`);
+    new Notice(`Gitvault Sync: подключено к ${c.owner}/${c.repo}, синхронизация запущена`);
     this.start();
+    this.tab.display(); // the settings tab may be open behind the password modal
   }
 
   /** Forgets the secrets; the sync state stays so signing in again resumes without a full re-scan. */
