@@ -18,7 +18,7 @@
 2. Webhook: снять галочку «Active».
 3. Permissions → Repository permissions → Contents: **Read and write** (Metadata: Read подставится сам).
 4. Отметить **Enable Device Flow**.
-5. Where can this GitHub App be installed: **Only on this account**.
+5. Where can this GitHub App be installed: **Any account** (иначе другие пользователи опубликованного плагина не смогут установить App; для чисто личной сборки достаточно «Only on this account»).
 6. В разделе Optional features отключить истечение user-to-server токенов (Opt-out of user-to-server token expiration).
 7. Create GitHub App. Скопировать **Client ID** и **slug** (последний сегмент в `https://github.com/apps/<slug>`).
 8. Вписать значения в код и пересобрать:
