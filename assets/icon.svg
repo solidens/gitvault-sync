@@ -1,23 +1,39 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#7C3AED"/>
-      <stop offset="1" stop-color="#0EA5E9"/>
-    </linearGradient>
-  </defs>
-  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+<defs>
+  <path id="spark" d="M0,-100 C8,-14 14,-8 100,0 C14,8 8,14 0,100 C-8,14 -14,8 -100,0 C-14,-8 -8,-14 0,-100Z"/>
+  <filter id="specksLime" x="0" y="0" width="100%" height="100%">
+    <feTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="2" seed="7"/>
+    <feColorMatrix type="matrix" values="0 0 0 0 0.83  0 0 0 0 0.98  0 0 0 0 0.14  14 0 0 0 -10.2"/>
+  </filter>
+  <filter id="specksBlack" x="0" y="0" width="100%" height="100%">
+    <feTurbulence type="fractalNoise" baseFrequency="0.7" numOctaves="3" seed="3"/>
+    <feColorMatrix type="matrix" values="0 0 0 0 0.04  0 0 0 0 0.04  0 0 0 0 0.04  0 14 0 0 -10.4"/>
+  </filter>
+  <filter id="rough"><feTurbulence type="fractalNoise" baseFrequency="0.04" numOctaves="2" seed="5"/><feDisplacementMap in="SourceGraphic" scale="3"/></filter>
+</defs>
+<clipPath id="disc"><circle cx="256" cy="256" r="236"/></clipPath>
+<rect width="512" height="512" fill="#0B0B0B"/>
+<rect width="512" height="512" filter="url(#specksLime)" opacity=".5"/>
+<g filter="url(#rough)">
+  <circle cx="256" cy="256" r="236" fill="#D3FB23"/>
+  <g clip-path="url(#disc)"><rect width="512" height="512" filter="url(#specksBlack)" opacity=".5"/></g>
+  <!-- orbit, back half -->
+  <path d="M66,330 C80,230 320,150 430,196" fill="none" stroke="#0B0B0B" stroke-width="16" stroke-linecap="round"/>
   <!-- shackle -->
-  <path d="M176 232 V176 a80 80 0 0 1 160 0 V232" fill="none" stroke="#fff" stroke-width="36" stroke-linecap="round"/>
-  <!-- lock body -->
-  <rect x="128" y="224" width="256" height="200" rx="44" fill="#fff"/>
-  <!-- git branch inside -->
-  <g stroke="#6D28D9" stroke-width="18" stroke-linecap="round" fill="none">
-    <path d="M216 272 V376"/>
-    <path d="M296 296 C296 336 216 330 216 360"/>
-  </g>
-  <g fill="#6D28D9">
-    <circle cx="216" cy="272" r="20"/>
-    <circle cx="216" cy="380" r="20"/>
-    <circle cx="296" cy="292" r="20"/>
-  </g>
+  <path d="M188,236 V182 a68,68 0 0 1 136,0 V236" fill="none" stroke="#0B0B0B" stroke-width="40" stroke-linecap="round"/>
+  <!-- body -->
+  <rect x="134" y="222" width="244" height="192" rx="56" fill="#0B0B0B"/>
+  <rect x="150" y="238" width="212" height="160" rx="42" fill="none" stroke="#D3FB23" stroke-width="7"/>
+  <use href="#spark" transform="translate(210 302) scale(.33)" fill="#D3FB23"/>
+  <use href="#spark" transform="translate(302 302) scale(.33)" fill="#D3FB23"/>
+  <!-- orbit, front half: lime outline then black stroke -->
+  <path d="M430,196 C510,226 480,320 404,354 C330,386 190,396 88,366" fill="none" stroke="#D3FB23" stroke-width="34" stroke-linecap="round"/>
+  <path d="M430,196 C510,226 480,320 404,354 C330,386 190,396 88,366" fill="none" stroke="#0B0B0B" stroke-width="16" stroke-linecap="round"/>
+  <circle cx="88" cy="366" r="24" fill="#0B0B0B"/><circle cx="88" cy="366" r="9" fill="#D3FB23"/>
+  <circle cx="430" cy="196" r="24" fill="#0B0B0B"/><circle cx="430" cy="196" r="9" fill="#D3FB23"/>
+  <use href="#spark" transform="translate(118 150) scale(.38)" fill="#0B0B0B"/>
+  <use href="#spark" transform="translate(372 110) scale(.2)" fill="#0B0B0B"/>
+  <use href="#spark" transform="translate(396 428) scale(.3)" fill="#0B0B0B"/>
+  <use href="#spark" transform="translate(160 452) scale(.16)" fill="#0B0B0B"/>
+</g>
 </svg>
