@@ -48,7 +48,8 @@ export class ObsidianFs implements LocalFs {
   }
 
   read(path: string): Promise<ArrayBuffer> {
-    return this.adapter.readBinary(path);
+    const f = this.file(path); // the vault API where it can (cached, serialised); config files aren't indexed
+    return f ? this.app.vault.readBinary(f) : this.adapter.readBinary(path);
   }
 
   // Deliberately the adapter, not vault.getAbstractFileByPath: the engine's case-collision check needs

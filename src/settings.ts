@@ -99,8 +99,7 @@ export class GitvaultSettingTab extends PluginSettingTab {
     c.empty();
 
     const token = plugin.token();
-    if (!(token && s.owner)) {
-      new Setting(c).setName(t("Connection", "Подключение")).setHeading();
+    if (!(token && s.owner)) { // a single section: no heading (plugin guidelines)
       c.createEl("p", { cls: "setting-item-description", text:
         t("Your vault syncs through your own private GitHub repository, encrypted with your password. " +
           "Sign in — the plugin works out whether this is your first device or the vault is already set up on another one.",
