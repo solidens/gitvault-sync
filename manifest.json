@@ -3,7 +3,8 @@
   "name": "Gitvault Sync",
   "version": "0.1.0",
   "minAppVersion": "1.8.7",
-  "description": "Encrypted vault sync to a private GitHub repo.",
-  "author": "Gitvault Sync",
-  "isDesktopOnly": false
+  "description": "End-to-end encrypted sync through your own private GitHub repository.",
+  "author": "solidens",
+  "isDesktopOnly": false,
+  "authorUrl": "https://github.com/solidens"
 }
