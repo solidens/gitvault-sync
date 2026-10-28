@@ -46,7 +46,7 @@ test("config uses PBKDF2+HKDF; unlock refuses unknown format, alg or iteration c
   const { config } = await createVault("pw", 100_000);
   expect(config.kdf.alg).toBe("PBKDF2-SHA256+HKDF");
   const bad = (patch: object, kdf: object = {}) => unlockVault("pw", { ...config, ...patch, kdf: { ...config.kdf, ...kdf } } as never);
-  await expect(bad({ format: 2 })).rejects.toThrow("формат");
-  await expect(bad({}, { alg: "PBKDF2-SHA256" })).rejects.toThrow("алгоритм");
-  for (const iterations of [99_999, 10_000_001, 1.5]) await expect(bad({}, { iterations })).rejects.toThrow("итераций");
+  await expect(bad({ format: 2 })).rejects.toThrow("format");
+  await expect(bad({}, { alg: "PBKDF2-SHA256" })).rejects.toThrow("algorithm");
+  for (const iterations of [99_999, 10_000_001, 1.5]) await expect(bad({}, { iterations })).rejects.toThrow("iteration");
 });

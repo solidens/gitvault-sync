@@ -1,3 +1,4 @@
+import { t } from "./i18n";
 import type { TokenBucket } from "./bucket";
 import { decryptFile, encryptFile, pathToken, type VaultKeys } from "./crypto";
 import type { GitHubApi } from "./github";
@@ -34,7 +35,7 @@ export const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
 };
 
 const CONFIG_FILE = "gitvault.json";
-export const UNDECRYPTABLE = "Файл на GitHub не расшифровывается — пароль или gitvault.json изменились";
+export const UNDECRYPTABLE = t("A file on GitHub can't be decrypted — the password or gitvault.json has changed", "Файл на GitHub не расшифровывается — пароль или gitvault.json изменились");
 
 /** localHash of a remote file kept only as a conflict copy because its path differs from a local one only by case. */
 const CASE_COLLISION = "case-collision";

@@ -37,3 +37,9 @@ test("hasForbiddenName", () => {
   for (const p of ["a:b.md", "d/x?.md", "q\"x.md", "a*b", "a<b", "a>b", "a|b", "a\\b"]) expect(hasForbiddenName(p)).toBe(true);
   expect(hasForbiddenName("Папка/Заметка (conflict iPhone 2026-10-27 1130).md")).toBe(false);
 });
+
+test("i18n: English by default (no Obsidian language set)", async () => {
+  const { t, isRu } = await import("../src/i18n");
+  expect(isRu).toBe(false);
+  expect(t("Sync now", "Синхронизировать сейчас")).toBe("Sync now");
+});

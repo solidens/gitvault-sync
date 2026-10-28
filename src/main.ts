@@ -1,3 +1,4 @@
+import { isRu, t } from "./i18n";
 import { moment, Notice, Platform, Plugin, TFile } from "obsidian";
 import { TokenBucket } from "./bucket";
 import { unlockVault, WrongPasswordError, type VaultKeys } from "./crypto";
@@ -20,7 +21,7 @@ const errText = (e: unknown): string => (e instanceof Error ? e.message : String
 
 function conflictsLabel(n: number): string {
   const d = n % 10, h = n % 100;
-  const word = d === 1 && h !== 11 ? "конфликт" : d >= 2 && d <= 4 && (h < 12 || h > 14) ? "конфликта" : "конфликтов";
+  const word = !isRu ? (n === 1 ? "conflict" : "conflicts") : d === 1 && h !== 11 ? "конфликт" : d >= 2 && d <= 4 && (h < 12 || h > 14) ? "конфликта" : "конфликтов";
   return `⚠ ${n} ${word}`;
 }
 
@@ -61,9 +62,9 @@ export default class GitvaultSync extends Plugin {
     this.tab = new GitvaultSettingTab(this.app, this);
     this.addSettingTab(this.tab);
 
-    this.addCommand({ id: "sync-now", name: "Синхронизировать сейчас", callback: () => this.syncNow() });
-    this.addCommand({ id: "toggle-pause", name: "Пауза/продолжить", callback: () => this.togglePause() });
-    this.addCommand({ id: "show-status", name: "Показать статус", callback: () => this.showStatus() });
+    this.addCommand({ id: "sync-now", name: t("Sync now", "Синхронизировать сейчас"), callback: () => this.syncNow() });
+    this.addCommand({ id: "toggle-pause", name: t("Pause/resume sync", "Пауза/продолжить"), callback: () => this.togglePause() });
+    this.addCommand({ id: "show-status", name: t("Show sync status", "Показать статус"), callback: () => this.showStatus() });
 
     this.app.workspace.onLayoutReady(() => {
       // registered after layout-ready: the vault fires "create" for every file while indexing at startup
@@ -115,7 +116,7 @@ export default class GitvaultSync extends Plugin {
     this.initRetryable = false;
     const token = this.token();
     const { owner, repo } = this.settings;
-    if (!token || !owner) return this.setStatus("✗ не подключено");
+    if (!token || !owner) return this.setStatus(t("✗ not connected", "✗ не подключено"));
     const password = this.app.loadLocalStorage(PASSWORD_KEY);
     this.initing = true;
     const gen = this.gen;
@@ -123,7 +124,7 @@ export default class GitvaultSync extends Plugin {
       if (!password) return await unlock(this, owner, repo, token);
       const config = await fetchVaultConfig(this.api()!);
       if (gen !== this.gen) return;
-      if (!config) throw new Error("в репозитории нет gitvault.json");
+      if (!config) throw new Error(t("the repository has no gitvault.json", "в репозитории нет gitvault.json"));
       const keys = await unlockVault(password, config);
       if (gen !== this.gen) return; // connect() meanwhile: these keys belong to the old repo
       this.keys = keys;
@@ -134,7 +135,7 @@ export default class GitvaultSync extends Plugin {
       if (gen !== this.gen) return; // never clear a password connect() has just saved
       if (e instanceof WrongPasswordError) {
         this.app.saveLocalStorage(PASSWORD_KEY, null);
-        this.setStatus("✗ неверный пароль");
+        this.setStatus(t("✗ wrong password", "✗ неверный пароль"));
         return void unlock(this, owner, repo, token).catch((err) => this.fail(err));
       }
       this.fail(e);
@@ -171,8 +172,8 @@ export default class GitvaultSync extends Plugin {
     this.keys = c.keys;
     await this.saveSettings();
     if (gen !== this.gen) return;
-    this.log(`Подключено к ${c.owner}/${c.repo}`);
-    new Notice(`Gitvault Sync: подключено к ${c.owner}/${c.repo}, синхронизация запущена`);
+    this.log(t(`Connected to ${c.owner}/${c.repo}`, `Подключено к ${c.owner}/${c.repo}`));
+    new Notice(t(`Gitvault Sync: connected to ${c.owner}/${c.repo}, sync started`, `Gitvault Sync: подключено к ${c.owner}/${c.repo}, синхронизация запущена`));
     this.start();
     this.tab.display(); // the settings tab may be open behind the password modal
   }
@@ -186,7 +187,7 @@ export default class GitvaultSync extends Plugin {
     this.initRetryable = false;
     this.keys = this.engine = null;
     await this.scheduler.stop();
-    this.setStatus("✗ не подключено");
+    this.setStatus(t("✗ not connected", "✗ не подключено"));
   }
 
   private get stateDir(): string {
@@ -218,7 +219,7 @@ export default class GitvaultSync extends Plugin {
       },
       now: Date.now, bucket: this.bucket,
       confirmMassDelete: async (n, total) => {
-        const ok = await confirmModal(this.app, `Синхронизация удалит ${n} из ${total} файлов. Продолжить?`, "Удалить", "Не удалять");
+        const ok = await confirmModal(this.app, t(`Sync is about to delete ${n} of ${total} files. Continue?`, `Синхронизация удалит ${n} из ${total} файлов. Продолжить?`), t("Delete", "Удалить"), t("Don't delete", "Не удалять"));
         if (!ok) this.pauseAfterDeclinedDelete(n); // otherwise the next poll asks again in a few seconds
         return ok;
       },
@@ -228,14 +229,14 @@ export default class GitvaultSync extends Plugin {
   private pauseAfterDeclinedDelete(n: number): void {
     this.paused = true;
     void this.scheduler.stop(); // not awaited: called from inside the running sync
-    this.setStatus("⏸ удаление отклонено");
-    this.log(`Удаление ${n} файлов отклонено, синхронизация на паузе`);
-    new Notice(`Синхронизация на паузе: отклонено удаление ${n} файлов. Продолжить — команда «Пауза/продолжить»`);
+    this.setStatus(t("⏸ deletion declined", "⏸ удаление отклонено"));
+    this.log(t(`Deleting ${n} files declined, sync paused`, `Удаление ${n} файлов отклонено, синхронизация на паузе`));
+    new Notice(t(`Sync paused: deleting ${n} files was declined. Resume with the "Pause/resume sync" command`, `Синхронизация на паузе: отклонено удаление ${n} файлов. Продолжить — команда «Пауза/продолжить»`));
   }
 
   private start(): void {
     if (!this.engine) return;
-    if (this.paused) return this.setStatus("⏸ пауза");
+    if (this.paused) return this.setStatus(t("⏸ paused", "⏸ пауза"));
     this.scheduler.start();
     this.scheduler.runNow();
   }
@@ -250,7 +251,7 @@ export default class GitvaultSync extends Plugin {
     this.paused = !this.paused;
     if (this.paused) {
       void this.scheduler.stop();
-      this.setStatus("⏸ пауза");
+      this.setStatus(t("⏸ paused", "⏸ пауза"));
     } else this.start();
   }
 
@@ -269,48 +270,48 @@ export default class GitvaultSync extends Plugin {
   private report(r: SyncReport): void {
     for (const p of r.conflicts) {
       this.conflicts.add(p);
-      new Notice(`Конфликт: создана копия ${p}`);
-      this.log(`Конфликт: создана копия ${p}`, p);
+      new Notice(t(`Conflict: saved a copy ${p}`, `Конфликт: создана копия ${p}`));
+      this.log(t(`Conflict: saved a copy ${p}`, `Конфликт: создана копия ${p}`), p);
     }
     for (const p of r.skippedLarge) {
       if (this.warnedLarge.has(p)) continue;
       this.warnedLarge.add(p);
-      new Notice(`Не синхронизируется (больше 50 МБ): ${p}`);
-      this.log(`Не синхронизируется (больше 50 МБ): ${p}`);
+      new Notice(t(`Not synced (over 50 MB): ${p}`, `Не синхронизируется (больше 50 МБ): ${p}`));
+      this.log(t(`Not synced (over 50 MB): ${p}`, `Не синхронизируется (больше 50 МБ): ${p}`));
     }
     for (const p of r.skippedName) {
       if (this.warnedLarge.has(p)) continue;
       this.warnedLarge.add(p);
-      new Notice(`Не синхронизируется (недопустимые символы * " \\ < > : | ? в имени): ${p}`);
-      this.log(`Не синхронизируется (недопустимые символы в имени): ${p}`);
+      new Notice(t(`Not synced (name contains * " \\ < > : | ?): ${p}`, `Не синхронизируется (недопустимые символы * " \\ < > : | ? в имени): ${p}`));
+      this.log(t(`Not synced (forbidden characters in the name): ${p}`, `Не синхронизируется (недопустимые символы в имени): ${p}`));
     }
     if (r.pulled.length || r.pushed.length || r.deleted.length) {
-      this.log(`Загружено ${r.pulled.length}, отправлено ${r.pushed.length}, удалено ${r.deleted.length}`);
+      this.log(t(`Downloaded ${r.pulled.length}, uploaded ${r.pushed.length}, deleted ${r.deleted.length}`, `Загружено ${r.pulled.length}, отправлено ${r.pushed.length}, удалено ${r.deleted.length}`));
     }
     if (r.pulled.some((p) => p.startsWith(this.app.vault.configDir + "/"))) {
-      new Notice("Настройки обновлены: применятся после перезапуска Obsidian");
+      new Notice(t("Settings updated: restart Obsidian to apply them", "Настройки обновлены: применятся после перезапуска Obsidian"));
     }
     if (r.rateLimitedUntil) {
       this.scheduler.pauseUntil(r.rateLimitedUntil);
-      this.log(`Лимит GitHub, пауза до ${hhmm(r.rateLimitedUntil)}`);
+      this.log(t(`GitHub rate limit, paused until ${hhmm(r.rateLimitedUntil)}`, `Лимит GitHub, пауза до ${hhmm(r.rateLimitedUntil)}`));
       if (!this.paused) {
-        this.setStatus(`⏸ лимит GitHub до ${hhmm(r.rateLimitedUntil)}`);
-        this.mobileNotice("лимит GitHub", `⏸ лимит GitHub до ${hhmm(r.rateLimitedUntil)}`);
+        this.setStatus(t(`⏸ GitHub limit until ${hhmm(r.rateLimitedUntil)}`, `⏸ лимит GitHub до ${hhmm(r.rateLimitedUntil)}`));
+        this.mobileNotice("лимит GitHub", t(`⏸ GitHub limit until ${hhmm(r.rateLimitedUntil)}`, `⏸ лимит GitHub до ${hhmm(r.rateLimitedUntil)}`));
       }
       return;
     }
-    if (r.gaveUp.length) this.log(`Не удалось отправить ${r.gaveUp.length}: GitHub менялся во время отправки, повтор позже`);
+    if (r.gaveUp.length) this.log(t(`Could not upload ${r.gaveUp.length}: GitHub changed during the upload, will retry`, `Не удалось отправить ${r.gaveUp.length}: GitHub менялся во время отправки, повтор позже`));
     // a conflict counts until the user deletes its copy
     for (const p of this.conflicts) if (!this.app.vault.getAbstractFileByPath(p)) this.conflicts.delete(p);
     if (this.paused) return;
-    this.setStatus(r.gaveUp.length ? `⚠ не удалось отправить ${r.gaveUp.length}`
+    this.setStatus(r.gaveUp.length ? t(`⚠ ${r.gaveUp.length} not uploaded`, `⚠ не удалось отправить ${r.gaveUp.length}`)
       : this.conflicts.size ? conflictsLabel(this.conflicts.size) : `✓ ${hhmm(Date.now())}`);
   }
 
   private fail(e: unknown): void {
     if (e instanceof AuthError) void this.scheduler.stop();
-    const msg = e instanceof AuthError ? "войдите снова" : errText(e);
-    this.log(`Ошибка: ${msg}`);
+    const msg = e instanceof AuthError ? t("sign in again", "войдите снова") : errText(e);
+    this.log(t(`Error: ${msg}`, `Ошибка: ${msg}`));
     if (this.paused) return;
     this.setStatus(`✗ ${msg}`);
     this.mobileNotice(msg, `✗ ${msg}`);

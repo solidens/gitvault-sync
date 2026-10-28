@@ -62,10 +62,10 @@ export async function createVault(password: string, iterations = 600_000) {
 
 /** config comes from the repo: anything unexpected is refused before spending CPU on it. */
 export async function unlockVault(password: string, config: VaultConfig): Promise<VaultKeys> {
-  if (config?.format !== 1) throw new Error("gitvault.json: неизвестный формат");
-  if (config.kdf?.alg !== KDF_ALG) throw new Error(`gitvault.json: неподдерживаемый алгоритм ключа ${String(config.kdf?.alg)}`);
+  if (config?.format !== 1) throw new Error("gitvault.json: unknown format");
+  if (config.kdf?.alg !== KDF_ALG) throw new Error(`gitvault.json: unsupported key algorithm ${String(config.kdf?.alg)}`);
   const n = config.kdf.iterations;
-  if (!Number.isInteger(n) || n < MIN_ITERATIONS || n > MAX_ITERATIONS) throw new Error(`gitvault.json: недопустимое число итераций ${n}`);
+  if (!Number.isInteger(n) || n < MIN_ITERATIONS || n > MAX_ITERATIONS) throw new Error(`gitvault.json: invalid iteration count ${n}`);
   const keys = await deriveKeys(password, b64decode(config.kdf.salt), config.kdf.iterations);
   try {
     if (new TextDecoder().decode(await open(keys, config.kcv)) === KCV_PLAIN) return keys;
