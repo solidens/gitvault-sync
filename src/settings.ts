@@ -22,7 +22,7 @@ export const TOKEN_KEY = "gitvault-sync:token";
 export const PASSWORD_KEY = "gitvault-sync:password";
 export const DEVICE_ID_KEY = "gitvault-sync:deviceId";
 
-export const APP_SLUG = "REPLACE_WITH_APP_SLUG";
+export const APP_SLUG = "gitvault-sync";
 const CONFIG_PATH = "gitvault.json";
 const WARN_REPO_KB = 700 * 1024;
 

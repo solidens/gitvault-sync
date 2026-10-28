@@ -22,8 +22,8 @@
 6. В разделе Optional features отключить истечение user-to-server токенов (Opt-out of user-to-server token expiration).
 7. Create GitHub App. Скопировать **Client ID** и **slug** (последний сегмент в `https://github.com/apps/<slug>`).
 8. Вписать значения в код и пересобрать:
-   - `GITHUB_CLIENT_ID` в `src/auth.ts` (сейчас `"REPLACE_WITH_CLIENT_ID"`);
-   - `APP_SLUG` в `src/settings.ts` (сейчас `"REPLACE_WITH_APP_SLUG"`);
+   - `GITHUB_CLIENT_ID` в `src/auth.ts` (в сборке — официальное приложение `Iv23liy5F3TWJKmuCvnj`);
+   - `APP_SLUG` в `src/settings.ts` (в сборке — `gitvault-sync`);
    - `npm run build`.
 
 ### Проверить при регистрации приложения

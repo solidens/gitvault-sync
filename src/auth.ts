@@ -2,7 +2,7 @@ import { AuthError, HttpError, type Http } from "./http";
 
 export interface DeviceCode { deviceCode: string; userCode: string; verificationUri: string; interval: number; expiresAt: number }
 
-export const GITHUB_CLIENT_ID = "REPLACE_WITH_CLIENT_ID";
+export const GITHUB_CLIENT_ID = "Iv23liy5F3TWJKmuCvnj";
 
 const jsonHeaders = { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" };
 const form = (o: Record<string, string>) => new URLSearchParams(o).toString();
