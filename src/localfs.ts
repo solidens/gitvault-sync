@@ -3,7 +3,6 @@ export interface FileStat { path: string; mtime: number; size: number }
 export class LocalChangedError extends Error {
   constructor(public path: string) { super(`changed meanwhile: ${path}`); this.name = "LocalChangedError"; }
 }
-/** Empty folders are entries too: path ends with "/", no content, mtime 0. Writing one is idempotent; trashing one only removes it while empty. */
 export interface LocalFs {
   list(includeConfig: boolean): Promise<FileStat[]>; // paths as on disk
   read(path: string): Promise<ArrayBuffer>;

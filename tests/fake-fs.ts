@@ -11,10 +11,6 @@ export class FakeFs implements LocalFs {
   caseInsensitive = false;
   onBeforeWrite?: (path: string) => void | Promise<void>;
   private files = new Map<string, { path: string; data: ArrayBuffer; mtime: number }>();
-  private dirs = new Map<string, string>(); // explicitly created folders ("a/b/"), key -> path
-  private empty(k: string): boolean {
-    return ![...this.files.keys(), ...this.dirs.keys()].some((x) => x !== k && x.startsWith(k));
-  }
   private clock = 0;
 
   constructor(opts: { nfd?: boolean; caseInsensitive?: boolean } = {}) {
@@ -35,27 +31,20 @@ export class FakeFs implements LocalFs {
   }
 
   async list(includeConfig: boolean): Promise<FileStat[]> {
-    const dirs = [...this.dirs].filter(([k]) => this.empty(k)).map(([, p]) => ({ path: this.nfd ? p.normalize("NFD") : p, mtime: 0, size: 0 }));
     return [...this.files.keys()]
       .filter((k) => includeConfig || !this.files.get(k)!.path.startsWith(".obsidian/"))
-      .map((k) => this.st(k)).concat(dirs);
+      .map((k) => this.st(k));
   }
   async read(path: string): Promise<ArrayBuffer> {
-    if (path.endsWith("/")) return new ArrayBuffer(0);
     const f = this.files.get(this.key(path));
     if (!f) throw new Error(`ENOENT: ${path}`);
     return f.data.slice(0);
   }
   async stat(path: string): Promise<FileStat | null> {
-    if (path.endsWith("/")) {
-      const k = this.key(path);
-      return this.dirs.has(k) || [...this.files.keys()].some((x) => x.startsWith(k)) ? { path, mtime: 0, size: 0 } : null;
-    }
     return this.files.has(this.key(path)) ? this.st(this.key(path)) : null;
   }
   async write(path: string, data: ArrayBuffer, expected?: ArrayBuffer | null): Promise<FileStat> {
     await this.onBeforeWrite?.(nfc(path));
-    if (path.endsWith("/")) { this.mkdir(path); return { path, mtime: 0, size: 0 }; }
     if (expected !== undefined) { // compare-and-swap, like vault.process against the editor's content
       const cur = this.files.get(this.key(path))?.data;
       const same = !cur || !expected ? !cur && !expected : Buffer.from(cur).equals(Buffer.from(expected));
@@ -65,9 +54,7 @@ export class FakeFs implements LocalFs {
     return this.st(this.key(path));
   }
   async trash(path: string): Promise<void> {
-    const k = this.key(path);
-    if (path.endsWith("/")) { if (this.empty(k)) this.dirs.delete(k); return; }
-    this.files.delete(k);
+    this.files.delete(this.key(path));
   }
 
   // sync test helpers; set() counts as a user edit
@@ -76,17 +63,12 @@ export class FakeFs implements LocalFs {
   }
   remove(path: string): void {
     this.files.delete(this.key(path));
-    this.dirs.delete(this.key(path));
-  }
-  mkdir(path: string): void {
-    const p = path.endsWith("/") ? path : path + "/";
-    this.dirs.set(this.key(p), this.dirs.get(this.key(p)) ?? nfc(p));
   }
   has(path: string): boolean {
     return this.files.has(this.key(path));
   }
   paths(): string[] {
-    return [...this.files.values()].map((f) => f.path).concat([...this.dirs].filter(([k]) => this.empty(k)).map(([, p]) => p)).sort();
+    return [...this.files.values()].map((f) => f.path).sort();
   }
 }
 
