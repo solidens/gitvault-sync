@@ -5,7 +5,7 @@ import { AuthError, RateLimitError, ShaConflictError } from "./http";
 import { LocalChangedError, type LocalFs } from "./localfs";
 import { isMergeablePath, MAX_MERGE_BYTES, merge3, mergeJson, tryDecodeUtf8 } from "./merge";
 import { emptyState, type StateStore, type SyncState } from "./state";
-import { alwaysIgnored, conflictPath, gitBlobSha, isIgnored, nfc, repoPath, sha256Hex } from "./util";
+import { alwaysIgnored, conflictPath, gitBlobSha, hasForbiddenName, isIgnored, nfc, repoPath, sha256Hex } from "./util";
 
 export interface EngineSettings {
   syncConfig: boolean; ignore: string[];
@@ -18,7 +18,7 @@ export interface EngineSettings {
   pluginId: string;           // manifest.id
 }
 /** gaveUp: local changes not sent because GitHub kept moving (sha conflicts); the next cycle tries again. */
-export interface SyncReport { pulled: string[]; pushed: string[]; deleted: string[]; conflicts: string[]; deferred: string[]; skippedLarge: string[]; gaveUp: string[]; rateLimitedUntil?: number }
+export interface SyncReport { pulled: string[]; pushed: string[]; deleted: string[]; conflicts: string[]; deferred: string[]; skippedLarge: string[]; skippedName: string[]; gaveUp: string[]; rateLimitedUntil?: number }
 export interface EngineDeps {
   api: GitHubApi; fs: LocalFs; keys: VaultKeys; store: StateStore; deviceName: string;
   settings: EngineSettings; now: () => number; bucket: TokenBucket;
@@ -59,7 +59,7 @@ export class SyncEngine {
 
   /** AuthError is rethrown (caller pauses); rate limits and persistent sha conflicts end the cycle with a report. */
   async sync(): Promise<SyncReport> {
-    const report: SyncReport = { pulled: [], pushed: [], deleted: [], conflicts: [], deferred: [], skippedLarge: [], gaveUp: [] };
+    const report: SyncReport = { pulled: [], pushed: [], deleted: [], conflicts: [], deferred: [], skippedLarge: [], skippedName: [], gaveUp: [] };
     try {
       for (let retry = 0; ; retry++) {
         const state = (await this.d.store.load()) ?? emptyState();
@@ -85,7 +85,7 @@ export class SyncEngine {
   /** One pass. repoll = skip the ETag so a retry after a sha conflict sees the new head. */
   private async cycle(state: SyncState, report: SyncReport, repoll: boolean): Promise<void> {
     const { api, fs, keys, store, settings } = this.d;
-    report.deferred = []; report.skippedLarge = []; // describe the latest pass; the other lists accumulate across retries
+    report.deferred = []; report.skippedLarge = []; report.skippedName = []; // describe the latest pass; the other lists accumulate across retries
     const first = Object.entries(state.files)[0];
     // records made with other keys: the user unlocked a vault re-created meanwhile, so this state describes nothing
     if (first && await pathToken(keys, first[0]) !== first[1].token) Object.assign(state, emptyState(), { filter: undefined, skipped: undefined, configSha: undefined });
@@ -94,7 +94,7 @@ export class SyncEngine {
     const ignore = [...alwaysIgnored(settings.configDir, settings.pluginId), ...settings.ignore];
     const tooLarge = new Set<string>();
     const skip = (p: string) =>
-      tooLarge.has(p) || isIgnored(p, ignore) || (!settings.syncConfig && p.startsWith(settings.configDir + "/"));
+      tooLarge.has(p) || hasForbiddenName(p) || isIgnored(p, ignore) || (!settings.syncConfig && p.startsWith(settings.configDir + "/"));
 
     // Skip rules changed -> refetch the full tree so files that just became visible are seen as remote, not as new.
     const filter = JSON.stringify([settings.syncConfig, settings.ignore, settings.maxFileBytes, settings.configDir]);
@@ -125,6 +125,7 @@ export class SyncEngine {
     for (const st of await fs.list(settings.syncConfig)) {
       const p = nfc(st.path);
       lower.set(p.toLowerCase(), p);
+      if (hasForbiddenName(p)) report.skippedName.push(p);
       if (skip(p)) continue;
       if (st.size > settings.maxFileBytes) {
         tooLarge.add(p);
@@ -148,6 +149,7 @@ export class SyncEngine {
       const cached = state.skipped?.[token];
       // unknown token: only the content knows its path
       const f = cached?.blobSha === sha ? { path: cached.path, data: undefined } : await this.download(sha);
+      if (hasForbiddenName(f.path)) report.skippedName.push(f.path);
       if (skip(f.path)) skipped[token] = { blobSha: sha, path: f.path };
       else remote.set(f.path, { token, sha, data: f.data });
     };
@@ -195,7 +197,7 @@ export class SyncEngine {
         this.refused.delete(q);
         return st;
       } catch (e) {
-        if (!(e instanceof LocalChangedError)) throw e;
+        if (!(e instanceof LocalChangedError)) throw new Error(`${q}: ${e instanceof Error ? e.message : String(e)}`);
         const st = expected && await fs.stat(q);
         if (!st) return null;
         const disk = `${st.mtime}:${st.size}`, r = this.refused.get(q);

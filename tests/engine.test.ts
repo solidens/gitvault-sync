@@ -1,7 +1,8 @@
 import { expect, test, vi } from "vitest";
 import { TokenBucket } from "../src/bucket";
 import { AuthError, RateLimitError, ShaConflictError } from "../src/http";
-import { createVault } from "../src/crypto";
+import { createVault, encryptFile, pathToken } from "../src/crypto";
+import { repoPath } from "../src/util";
 import { SyncEngine, UNDECRYPTABLE } from "../src/engine";
 import { LocalChangedError } from "../src/localfs";
 import { FakeGitHub } from "./fake-github";
@@ -965,4 +966,21 @@ test("sha-conflict re-runs count a CAS refusal once per sync", async () => {
   expect((await B.engine.sync()).deferred).toEqual(["x.md"]); // second refusal, still below the backstop
   expect((await B.engine.sync()).deferred).toEqual([]);
   expect(await text(B.fs, "x.md")).toBe("two");
+});
+
+test("file name Obsidian can't create is skipped, not fatal, and never deleted remotely", async () => {
+  const { fake, keys } = await setupRepo();
+  const A = makeDevice(fake, keys, "A"), B = makeDevice(fake, keys, "B");
+  A.fs.set("ok.md", "ok");
+  await A.engine.sync();
+  // an older build (or another tool) put a forbidden name into the repo
+  const bad = "a:b?.md";
+  await fake.client().putFile(repoPath(await pathToken(keys, bad)), await encryptFile(keys, bad, new TextEncoder().encode("x").buffer), null, "m");
+  const r = await B.engine.sync();
+  expect(r.pulled).toEqual(["ok.md"]);
+  expect(r.skippedName).toEqual([bad]);
+  expect(B.fs.has(bad)).toBe(false);
+  expect((await B.engine.sync()).deleted).toEqual([]);
+  expect((await A.engine.sync()).deleted).toEqual([]);
+  expect(fTree(fake)).toHaveLength(2);
 });

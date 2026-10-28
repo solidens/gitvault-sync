@@ -274,6 +274,12 @@ export default class GitvaultSync extends Plugin {
       new Notice(`Не синхронизируется (больше 50 МБ): ${p}`);
       this.log(`Не синхронизируется (больше 50 МБ): ${p}`);
     }
+    for (const p of r.skippedName) {
+      if (this.warnedLarge.has(p)) continue;
+      this.warnedLarge.add(p);
+      new Notice(`Не синхронизируется (недопустимые символы * " \\ < > : | ? в имени): ${p}`);
+      this.log(`Не синхронизируется (недопустимые символы в имени): ${p}`);
+    }
     if (r.pulled.length || r.pushed.length || r.deleted.length) {
       this.log(`Загружено ${r.pulled.length}, отправлено ${r.pushed.length}, удалено ${r.deleted.length}`);
     }

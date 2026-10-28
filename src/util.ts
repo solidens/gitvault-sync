@@ -72,3 +72,6 @@ function globToRegex(glob: string): RegExp {
 export function isIgnored(path: string, patterns: string[]): boolean {
   return patterns.some((g) => globToRegex(g).test(path));
 }
+
+/** Obsidian refuses these characters in file names on every platform (and Windows refuses them on disk). */
+export const hasForbiddenName = (path: string): boolean => /[*"\\<>:|?]/.test(path);
