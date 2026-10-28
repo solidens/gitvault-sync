@@ -1,8 +1,9 @@
-# Push a tag equal to manifest.json "version" (e.g. 0.1.0, no "v") → draft release with the files Obsidian needs.
+# Create a release in the GitHub UI with tag = manifest.json "version" (e.g. 0.1.0, no "v");
+# this workflow tests, builds and attaches the files Obsidian needs.
 name: Release
 on:
-  push:
-    tags: ["*"]
+  release:
+    types: [published]
 permissions:
   contents: write
 jobs:
@@ -16,7 +17,9 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build
-      - name: Create draft release
+      - name: Check tag matches manifest version
+        run: test "$(node -p "require('./manifest.json').version")" = "${{ github.event.release.tag_name }}"
+      - name: Attach plugin files
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" main.js manifest.json styles.css
+        run: gh release upload "${{ github.event.release.tag_name }}" main.js manifest.json styles.css --clobber
