@@ -34,7 +34,7 @@ export function makeDevice(
   const store = new MemoryStateStore();
   const api = fake.client();
   const now = opts.now ?? (() => Date.now());
-  const settings = { ...DEFAULT_ENGINE_SETTINGS, ...opts.settings }; // mutable: tests toggle settings mid-life
+  const settings: EngineSettings = { ...DEFAULT_ENGINE_SETTINGS, configDir: ".obsidian", pluginId: "gitvault-sync", ...opts.settings }; // mutable: tests toggle settings mid-life
   const deps = {
     api, fs, keys, store, deviceName: name, now, settings,
     bucket: opts.bucket ?? new TokenBucket(20, 4, now),

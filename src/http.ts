@@ -22,3 +22,6 @@ export const obsidianHttp: Http = async (req) => {
   // lazy: decoding a tarball as text would waste memory, reading JSON as a buffer too
   return { status: r.status, headers: r.headers, get text() { return r.text; }, get arrayBuffer() { return r.arrayBuffer; } };
 };
+
+/** JSON.parse with the response's expected shape: the one place an external payload gets a type. */
+export const parseJson = <T>(text: string): T => JSON.parse(text) as T;

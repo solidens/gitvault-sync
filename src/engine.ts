@@ -26,12 +26,12 @@ export interface EngineDeps {
   confirmMassDelete: (count: number, total: number) => Promise<boolean>;
 }
 
-export const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
+/** The vault-specific fields (configDir, pluginId) come from the running app. */
+export const DEFAULT_ENGINE_SETTINGS: Omit<EngineSettings, "configDir" | "pluginId"> = {
   syncConfig: false, ignore: [],
   batchThreshold: 5, tarballThreshold: 300,
   massDeletePercent: 20, massDeleteMin: 10,
   maxFileBytes: 50 * 1024 * 1024,
-  configDir: ".obsidian", pluginId: "gitvault-sync",
 };
 
 const CONFIG_FILE = "gitvault.json";
@@ -230,7 +230,7 @@ export class SyncEngine {
       }
       if (!rem) { // deleted on GitHub (rec exists)
         if (loc && localChanged) { // edit beats delete; uploaded as new, so drop the record of the deleted remote blob
-          pushes.push({ path: p, token: rec!.token, prev: null, local: loc });
+          pushes.push({ path: p, token: rec.token, prev: null, local: loc });
           delete state.files[p];
         } else if (loc) trashes.push({ p, loc });
         else delete state.files[p];
@@ -285,7 +285,7 @@ export class SyncEngine {
       if (!mine) { report.deferred.push(p); continue; }
       const merged = await this.merge(p, rec?.blobSha, mine, data);
       if (merged !== null) {
-        const out = new TextEncoder().encode(merged).buffer as ArrayBuffer;
+        const out = new TextEncoder().encode(merged).buffer;
         const mh = await sha256Hex(out);
         const st = mh === loc.hash ? loc : await put(loc.diskPath, mh === hash ? data : out, mine);
         if (!st) { report.deferred.push(p); continue; }

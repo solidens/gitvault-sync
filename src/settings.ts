@@ -1,5 +1,5 @@
 import { t } from "./i18n";
-import { App, Modal, moment, Notice, Platform, PluginSettingTab, Setting } from "obsidian";
+import { App, debounce, Modal, moment, Notice, Platform, PluginSettingTab, Setting, type SettingDefinitionItem } from "obsidian";
 import { GITHUB_CLIENT_ID, listInstallationRepos, pollDeviceToken, startDeviceFlow } from "./auth";
 import { createVault, unlockVault, WrongPasswordError, type VaultConfig, type VaultKeys } from "./crypto";
 import { RestGitHub, type GitHubApi } from "./github";
@@ -90,70 +90,87 @@ export async function unlock(plugin: GitvaultSync, owner: string, repo: string, 
   }).open();
 }
 
+type ControlKey = "deviceName" | "syncConfig" | "ignore" | "massDeletePercent";
+
 export class GitvaultSettingTab extends PluginSettingTab {
+  // controls commit as the user types: save once typing pauses, since each save rebuilds the engine
+  private saveSoon = debounce(() => void this.plugin.saveSettings(), 800, true);
+
   constructor(app: App, private plugin: GitvaultSync) { super(app, plugin); }
 
-  display(): void {
-    const { containerEl: c, plugin } = this;
-    const s = plugin.settings;
-    c.empty();
-
-    const token = plugin.token();
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    const { plugin } = this;
+    const s = plugin.settings, token = plugin.token();
     if (!(token && s.owner)) { // a single section: no heading (plugin guidelines)
-      c.createEl("p", { cls: "setting-item-description", text:
-        t("Your vault syncs through your own private GitHub repository, encrypted with your password. " +
-          "Sign in — the plugin works out whether this is your first device or the vault is already set up on another one.",
-        "Хранилище синхронизируется через ваш приватный репозиторий GitHub и шифруется паролем. " +
-          "Войдите — плагин сам поймёт, первое это устройство или хранилище уже настроено на другом.") });
-      new Setting(c).setName(t("Sign in with GitHub", "Войти через GitHub"))
-        .addButton((b) => b.setButtonText(t("Sign in", "Войти")).setCta().onClick(async () => { await login(plugin); this.display(); }));
-      return;
+      return [{
+        name: t("Sign in with GitHub", "Войти через GitHub"),
+        desc: t("Your vault syncs through your own private GitHub repository, encrypted with your password. " +
+            "Sign in — the plugin works out whether this is your first device or the vault is already set up on another one.",
+          "Хранилище синхронизируется через ваш приватный репозиторий GitHub и шифруется паролем. " +
+            "Войдите — плагин сам поймёт, первое это устройство или хранилище уже настроено на другом."),
+        render: (row) => {
+          row.addButton((b) => b.setButtonText(t("Sign in", "Войти")).setCta().onClick(async () => { await login(plugin); this.update(); }));
+        },
+      }];
     }
+    const api = plugin.api();
+    return [
+      { type: "group", heading: t("Connection", "Подключение"), items: [{
+        name: t(`Vault ${s.owner}/${s.repo}`, `Хранилище ${s.owner}/${s.repo}`),
+        desc: plugin.isRunning() ? t("Sync is on.", "Синхронизация включена.") : t("Password not entered: sync is stopped.", "Пароль не введён: синхронизация остановлена."),
+        render: (row) => {
+          if (!plugin.isRunning()) {
+            row.addButton((b) => b.setButtonText(t("Enter password", "Ввести пароль")).setCta().onClick(() => {
+              unlock(plugin, s.owner, s.repo, token).catch((e) => new Notice(`Gitvault Sync: ${errText(e)}`));
+            }));
+          }
+          row.addButton((b) => b.setButtonText(t("Sign out", "Выйти")).setDestructive().onClick(async () => { await plugin.signOut(); this.update(); }));
+        },
+      }] },
+      { type: "group", heading: t("Sync", "Синхронизация"), items: [
+        { name: t("Device name", "Имя устройства"), desc: t("Used in commit messages and conflict copy names.", "Попадает в сообщения коммитов и имена конфликт-копий."),
+          control: { type: "text", key: "deviceName" } },
+        { name: t("Sync settings and plugins", "Синхронизировать настройки и плагины"),
+          desc: t(`The ${plugin.app.vault.configDir} folder; applies after restarting Obsidian.`, `Папка ${plugin.app.vault.configDir}; применится после перезапуска Obsidian.`),
+          control: { type: "toggle", key: "syncConfig" } },
+      ] },
+      { type: "group", heading: t("Advanced", "Дополнительно"), items: [
+        { name: t("Ignore", "Игнорировать"), desc: t("Path patterns, one per line, e.g. Attachments/** or *.pdf", "Шаблоны путей, по одному на строку, например Attachments/** или *.pdf"),
+          control: { type: "textarea", key: "ignore", rows: 4 } },
+        { name: t("Mass-deletion threshold, %", "Порог массового удаления, %"),
+          desc: t("If a sync would delete more than this share of files (and more than 10), it asks first.", "Если синхронизация удалит больше этой доли файлов (и больше 10 штук), она спросит подтверждение."),
+          control: { type: "number", key: "massDeletePercent", min: 1, max: 100, step: 1 } },
+        { name: t("Repository size", "Размер репозитория"), visible: !!api, searchable: false,
+          render: (row) => {
+            row.setDesc("…");
+            api?.repoSizeKb().then((kb) => {
+              row.setDesc(t(`${Math.round(kb / 1024)} MB`, `${Math.round(kb / 1024)} МБ`));
+              row.descEl.toggleClass("gvs-warn", kb >= WARN_REPO_KB);
+            }, (e) => row.setDesc(t(`error (${errText(e)})`, `ошибка (${errText(e)})`)));
+          } },
+      ] },
+    ];
+  }
 
-    new Setting(c).setName(t("Connection", "Подключение")).setHeading();
-    const row = new Setting(c).setName(t(`Vault ${s.owner}/${s.repo}`, `Хранилище ${s.owner}/${s.repo}`))
-      .setDesc(plugin.isRunning() ? t("Sync is on.", "Синхронизация включена.") : t("Password not entered: sync is stopped.", "Пароль не введён: синхронизация остановлена."));
-    if (!plugin.isRunning()) {
-      row.addButton((b) => b.setButtonText(t("Enter password", "Ввести пароль")).setCta().onClick(() => {
-        unlock(plugin, s.owner, s.repo, token).catch((e) => new Notice(`Gitvault Sync: ${errText(e)}`));
-      }));
-    }
-    row.addButton((b) => b.setButtonText(t("Sign out", "Выйти")).setWarning().onClick(async () => { await plugin.signOut(); this.display(); }));
+  getControlValue(key: string): unknown {
+    const s = this.plugin.settings;
+    return key === "ignore" ? s.ignore.join("\n") : s[key as ControlKey];
+  }
 
-    new Setting(c).setName(t("Sync", "Синхронизация")).setHeading();
-    // text fields save on "change" (blur/Enter), not per keystroke: each save rebuilds the engine
-    const onCommit = (el: HTMLInputElement | HTMLTextAreaElement, save: (v: string) => Promise<void>) =>
-      el.addEventListener("change", () => void save(el.value));
-    new Setting(c).setName(t("Device name", "Имя устройства")).setDesc(t("Used in commit messages and conflict copy names.", "Попадает в сообщения коммитов и имена конфликт-копий."))
-      .addText((t) => onCommit(t.setValue(s.deviceName).inputEl, async (v) => {
-        s.deviceName = v.trim() || defaultDeviceName();
-        await plugin.saveSettings();
-      }));
-    new Setting(c).setName(t("Sync settings and plugins", "Синхронизировать настройки и плагины")).setDesc(t("The .obsidian folder; applies after restarting Obsidian.", "Папка .obsidian; применится после перезапуска Obsidian."))
-      .addToggle((t) => t.setValue(s.syncConfig).onChange(async (v) => { s.syncConfig = v; await plugin.saveSettings(); }));
-    new Setting(c).setName(t("Advanced", "Дополнительно")).setHeading();
-    new Setting(c).setName(t("Ignore", "Игнорировать")).setDesc(t("Path patterns, one per line, e.g. Attachments/** or *.pdf", "Шаблоны путей, по одному на строку, например Attachments/** или *.pdf"))
-      .addTextArea((t) => onCommit(t.setValue(s.ignore.join("\n")).inputEl, async (v) => {
-        s.ignore = v.split("\n").map((l) => l.trim()).filter(Boolean);
-        await plugin.saveSettings();
-      }));
-    new Setting(c).setName(t("Mass-deletion threshold, %", "Порог массового удаления, %"))
-      .setDesc(t("If a sync would delete more than this share of files (and more than 10), it asks first.", "Если синхронизация удалит больше этой доли файлов (и больше 10 штук), она спросит подтверждение."))
-      .addText((t) => onCommit(t.setValue(String(s.massDeletePercent)).inputEl, async (v) => {
-        const n = Number(v);
+  setControlValue(key: string, value: unknown): void {
+    const s = this.plugin.settings;
+    switch (key as ControlKey) {
+      case "deviceName": s.deviceName = String(value).trim() || defaultDeviceName(); break;
+      case "syncConfig": s.syncConfig = value === true; break;
+      case "ignore": s.ignore = String(value).split("\n").map((l) => l.trim()).filter(Boolean); break;
+      case "massDeletePercent": {
+        const n = Number(value);
         if (!Number.isInteger(n) || n < 1 || n > 100) return;
         s.massDeletePercent = n;
-        await plugin.saveSettings();
-      }));
-
-    const api = plugin.api();
-    if (api) {
-      const size = c.createEl("p", { text: t("Repository size: …", "Размер репозитория: …"), cls: "gvs-repo-size" });
-      api.repoSizeKb().then((kb) => {
-        size.setText(t(`Repository size: ${Math.round(kb / 1024)} MB`, `Размер репозитория: ${Math.round(kb / 1024)} МБ`));
-        size.toggleClass("gvs-warn", kb >= WARN_REPO_KB);
-      }, (e) => size.setText(t(`Repository size: error (${errText(e)})`, `Размер репозитория: ошибка (${errText(e)})`)));
+        break;
+      }
     }
+    this.saveSoon();
   }
 }
 
@@ -215,7 +232,7 @@ class RepoModal extends Modal {
     let i = 0;
     new Setting(this.contentEl)
       .addDropdown((d) => {
-        this.repos.forEach((r, n) => d.addOption(String(n), `${r.owner}/${r.repo}`));
+        for (const [n, r] of this.repos.entries()) d.addOption(String(n), `${r.owner}/${r.repo}`);
         d.onChange((v) => { i = Number(v); });
       })
       .addButton((b) => b.setButtonText(t("Choose", "Выбрать")).setCta().onClick(() => { this.done(this.repos[i]); this.close(); }));
@@ -295,10 +312,10 @@ export function confirmModal(app: App, text: string, ok: string, cancel: string)
   return new Promise((resolve) => {
     let answer = false;
     const m = new Modal(app);
-    m.setTitle("Gitvault Sync");
+    m.setTitle(t("Confirm", "Подтверждение"));
     m.contentEl.createEl("p", { text });
     new Setting(m.contentEl)
-      .addButton((b) => b.setButtonText(ok).setWarning().onClick(() => { answer = true; m.close(); }))
+      .addButton((b) => b.setButtonText(ok).setDestructive().onClick(() => { answer = true; m.close(); }))
       .addButton((b) => b.setButtonText(cancel).onClick(() => m.close()));
     m.onClose = () => resolve(answer);
     m.open();
@@ -311,7 +328,7 @@ export class StatusModal extends Modal {
   constructor(app: App, private status: string, private events: SyncEvent[], private openFile: (path: string) => void) { super(app); }
 
   onOpen(): void {
-    this.setTitle("Gitvault Sync");
+    this.setTitle(t("Sync status", "Статус синхронизации"));
     const { contentEl: el } = this;
     el.createEl("p", { text: this.status });
     if (this.events.length === 0) el.createEl("p", { text: t("No events yet.", "Событий пока нет.") });

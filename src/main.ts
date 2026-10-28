@@ -52,7 +52,7 @@ export default class GitvaultSync extends Plugin {
   private gen = 0; // bumped by connect/signOut/unload: a slower init or sync started before must not apply its result
 
   async onload(): Promise<void> {
-    this.settings = { ...DEFAULT_SETTINGS, ...(await this.loadData()) };
+    this.settings = { ...DEFAULT_SETTINGS, ...((await this.loadData()) as Partial<PluginSettings> | null) };
     if (!this.settings.deviceName) this.settings.deviceName = defaultDeviceName();
     if (!this.app.loadLocalStorage(DEVICE_ID_KEY)) this.app.saveLocalStorage(DEVICE_ID_KEY, crypto.randomUUID());
 
@@ -88,7 +88,7 @@ export default class GitvaultSync extends Plugin {
   }
 
   token(): string | null {
-    return this.app.loadLocalStorage(TOKEN_KEY);
+    return this.app.loadLocalStorage(TOKEN_KEY) as string | null;
   }
 
   isRunning(): boolean {
@@ -117,7 +117,7 @@ export default class GitvaultSync extends Plugin {
     const token = this.token();
     const { owner, repo } = this.settings;
     if (!token || !owner) return this.setStatus(t("✗ not connected", "✗ не подключено"));
-    const password = this.app.loadLocalStorage(PASSWORD_KEY);
+    const password = this.app.loadLocalStorage(PASSWORD_KEY) as string | null;
     this.initing = true;
     const gen = this.gen;
     try {
@@ -175,7 +175,7 @@ export default class GitvaultSync extends Plugin {
     this.log(t(`Connected to ${c.owner}/${c.repo}`, `Подключено к ${c.owner}/${c.repo}`));
     new Notice(t(`Gitvault Sync: connected to ${c.owner}/${c.repo}, sync started`, `Gitvault Sync: подключено к ${c.owner}/${c.repo}, синхронизация запущена`));
     this.start();
-    this.tab.display(); // the settings tab may be open behind the password modal
+    this.tab.update(); // the settings tab may be open behind the password modal
   }
 
   /** Forgets the secrets; the sync state stays so signing in again resumes without a full re-scan. */

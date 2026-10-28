@@ -6,7 +6,6 @@ export const alwaysIgnored = (configDir: string, pluginId: string): string[] => 
   ".trash/**",
   ".git/**",
 ];
-export const ALWAYS_IGNORED = alwaysIgnored(".obsidian", "gitvault-sync");
 
 const bytes = (b: ArrayBuffer | Uint8Array) => (b instanceof Uint8Array ? b : new Uint8Array(b));
 const hex = (buf: ArrayBuffer) =>

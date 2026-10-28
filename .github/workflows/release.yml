@@ -1,11 +1,13 @@
-# Create a release in the GitHub UI with tag = manifest.json "version" (e.g. 0.1.0, no "v");
-# this workflow tests, builds and attaches the files Obsidian needs.
+# Create a release in the GitHub UI with tag = manifest.json "version" (e.g. 0.1.4, no "v");
+# this workflow lints, tests, builds, attests and attaches the files Obsidian needs.
 name: Release
 on:
   release:
     types: [published]
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -15,11 +17,25 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
+      - run: npm run lint
       - run: npm test
       - run: npm run build
       - name: Check tag matches manifest version
         run: test "$(node -p "require('./manifest.json').version")" = "${{ github.event.release.tag_name }}"
-      - name: Attach plugin files
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
+      - name: Attach plugin files, name the release after its version, add notes if empty
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.event.release.tag_name }}" main.js manifest.json styles.css --clobber
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$TAG" main.js manifest.json styles.css --clobber
+          if [ -z "$(gh release view "$TAG" --json body -q .body)" ]; then
+            gh release edit "$TAG" --title "$TAG" --notes "Gitvault Sync $TAG. Install or update from Settings → Community plugins."
+          else
+            gh release edit "$TAG" --title "$TAG"
+          fi

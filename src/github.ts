@@ -1,4 +1,4 @@
-import { AuthError, type Http, type HttpResponse, HttpError, RateLimitError, ShaConflictError } from "./http";
+import { AuthError, type Http, type HttpResponse, HttpError, parseJson, RateLimitError, ShaConflictError } from "./http";
 import { gunzip, parseTar } from "./tar";
 import { b64encode } from "./util";
 
@@ -66,13 +66,13 @@ export class RestGitHub implements GitHubApi {
     const r = await this.req("GET", "/git/ref/heads/main", { headers: etag ? { "If-None-Match": etag } : {}, allow: [304, 404, 409] });
     if (r.status === 304) return { notModified: true };
     if (r.status === 404 || r.status === 409) return { notModified: false, sha: null, etag: "" };
-    return { notModified: false, sha: JSON.parse(r.text).object.sha, etag: hdr(r, "etag") ?? "" };
+    return { notModified: false, sha: parseJson<{ object: { sha: string } }>(r.text).object.sha, etag: hdr(r, "etag") ?? "" };
   }
 
   async getTree(commitSha: string): Promise<Map<string, string>> {
-    const j = JSON.parse((await this.req("GET", `/git/trees/${commitSha}?recursive=1`)).text);
+    const j = parseJson<{ truncated: boolean; tree: { path: string; sha: string; type: string }[] }>((await this.req("GET", `/git/trees/${commitSha}?recursive=1`)).text);
     if (j.truncated) throw new Error("tree truncated");
-    return new Map(j.tree.filter((e: { type: string }) => e.type === "blob").map((e: { path: string; sha: string }) => [e.path, e.sha]));
+    return new Map(j.tree.filter((e) => e.type === "blob").map((e) => [e.path, e.sha]));
   }
 
   async getBlobText(blobSha: string): Promise<string> {
@@ -81,19 +81,19 @@ export class RestGitHub implements GitHubApi {
 
   async putFile(path: string, text: string, prevBlobSha: string | null, message: string) {
     const body = { message, content: b64encode(new TextEncoder().encode(text)), branch: "main", ...(prevBlobSha ? { sha: prevBlobSha } : {}) };
-    const j = JSON.parse((await this.req("PUT", `/contents/${enc(path)}`, { body, conflict: [409, 422], conflictPath: path })).text);
-    return { blobSha: j.content.sha as string, commitSha: j.commit.sha as string };
+    const j = parseJson<{ content: { sha: string }; commit: { sha: string } }>((await this.req("PUT", `/contents/${enc(path)}`, { body, conflict: [409, 422], conflictPath: path })).text);
+    return { blobSha: j.content.sha, commitSha: j.commit.sha };
   }
 
   async deleteFile(path: string, prevBlobSha: string, message: string) {
     const body = { message, sha: prevBlobSha, branch: "main" };
-    const j = JSON.parse((await this.req("DELETE", `/contents/${enc(path)}`, { body, conflict: [409, 422], conflictPath: path })).text);
-    return { commitSha: j.commit.sha as string };
+    const j = parseJson<{ commit: { sha: string } }>((await this.req("DELETE", `/contents/${enc(path)}`, { body, conflict: [409, 422], conflictPath: path })).text);
+    return { commitSha: j.commit.sha };
   }
 
   async commitBatch(baseCommit: string, changes: BatchChange[], message: string) {
-    const post = async (p: string, body: unknown) => JSON.parse((await this.req("POST", p, { body })).text);
-    let treeSha = JSON.parse((await this.req("GET", `/git/commits/${baseCommit}`)).text).tree.sha as string;
+    const post = async (p: string, body: unknown) => parseJson<{ sha: string }>((await this.req("POST", p, { body })).text);
+    let treeSha = parseJson<{ tree: { sha: string } }>((await this.req("GET", `/git/commits/${baseCommit}`)).text).tree.sha;
     let tree: object[] = [], size = 0;
     const flush = async () => { treeSha = (await post("/git/trees", { base_tree: treeSha, tree })).sha; tree = []; size = 0; };
     for (const ch of changes) {
@@ -105,7 +105,7 @@ export class RestGitHub implements GitHubApi {
     await flush();
     const c = await post("/git/commits", { message, tree: treeSha, parents: [baseCommit] });
     await this.req("PATCH", "/git/refs/heads/main", { body: { sha: c.sha, force: false }, conflict: [422] });
-    return { commitSha: c.sha as string };
+    return { commitSha: c.sha };
   }
 
   async getTarball(commitSha: string): Promise<Map<string, string>> {
@@ -117,16 +117,16 @@ export class RestGitHub implements GitHubApi {
   }
 
   async fileHistoryBlobShas(path: string, limit: number): Promise<string[]> {
-    const commits = JSON.parse((await this.req("GET", `/commits?path=${encodeURIComponent(path)}&per_page=${limit}`)).text);
+    const commits = parseJson<{ sha: string }[]>((await this.req("GET", `/commits?path=${encodeURIComponent(path)}&per_page=${limit}`)).text);
     const out: string[] = [];
     for (const c of commits) {
       const r = await this.req("GET", `/contents/${enc(path)}?ref=${c.sha}`, { allow: [404] });
-      if (r.status !== 404) out.push(JSON.parse(r.text).sha);
+      if (r.status !== 404) out.push(parseJson<{ sha: string }>(r.text).sha);
     }
     return out;
   }
 
   async repoSizeKb(): Promise<number> {
-    return JSON.parse((await this.req("GET", "")).text).size;
+    return parseJson<{ size: number }>((await this.req("GET", "")).text).size;
   }
 }

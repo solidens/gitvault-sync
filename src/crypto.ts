@@ -93,6 +93,6 @@ export async function decryptFile(keys: VaultKeys, text: string): Promise<{ path
   if (4 + n > plain.length) throw new Error("Corrupt file header");
   return {
     path: new TextDecoder().decode(plain.slice(4, 4 + n)),
-    data: plain.slice(4 + n).buffer as ArrayBuffer,
+    data: plain.slice(4 + n).buffer,
   };
 }

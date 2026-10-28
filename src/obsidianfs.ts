@@ -84,7 +84,7 @@ export class ObsidianFs implements LocalFs {
 
   async trash(path: string): Promise<void> {
     const f = this.file(path);
-    if (f) return this.app.vault.trash(f, true);
+    if (f) return this.app.fileManager.trashFile(f); // honours the user's "deleted files" preference
     if (!(await this.adapter.trashSystem(path))) await this.adapter.trashLocal(path);
   }
 

@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
-import { ALWAYS_IGNORED, hasForbiddenName, b64decode, b64encode, conflictPath, gitBlobSha, isIgnored, nfc, repoPath, sha256Hex } from "../src/util";
+const ALWAYS_IGNORED = alwaysIgnored(".obsidian", "gitvault-sync");
+import { alwaysIgnored, hasForbiddenName, b64decode, b64encode, conflictPath, gitBlobSha, isIgnored, nfc, repoPath, sha256Hex } from "../src/util";
 
 test("gitBlobSha matches git", async () => {
   expect(await gitBlobSha("hello\n")).toBe("ce013625030ba8dba906f756967f9e9ca394464a");
